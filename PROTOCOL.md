@@ -1,350 +1,189 @@
 # Wire protocol
 
-Reference for anyone reimplementing the bridge in another language (Go, Rust,
-Python) or building a custom client. This documents every endpoint and the
-state machine.
+Reference for reimplementing the bridge in another language or debugging
+exactly what's on the wire.
 
-## Headers used everywhere
+## Auth
 
-| Header | Where | Holds |
-| --- | --- | --- |
-| `x-external-secret` | external API + qa-assistant callbacks | `EXTERNAL_API_SECRET` |
-| `Authorization: Bearer <secret>` | qa-assistant inbound + cron | `EXTERNAL_API_SECRET` / `CRON_SECRET` |
-| `x-bridge-secret` | bridge ↔ web app | `BRIDGE_SECRET` |
-| Cookie `claude_admin` | admin UI + admin API | Signed session, see [`lib/admin-auth.ts`](lib/admin-auth.ts) |
+| Header | Value |
+| --- | --- |
+| `x-external-secret` | `EXTERNAL_API_SECRET` — external API + callback receivers |
+| `Authorization: Bearer <s>` | `EXTERNAL_API_SECRET` (qa-assistant) / `CRON_SECRET` (cron) |
+| `x-bridge-secret` | `BRIDGE_SECRET` — bridge ↔ web app |
+| Cookie `claude_admin` | Signed session for admin UI; see [`lib/admin-auth.ts`](lib/admin-auth.ts) |
 
 ## State machine
-
-Every prompt walks through these states:
 
 ```
    POST /api/external/prompt          POST /api/webhooks/bridge
                   │                                  │
                   ▼                                  ▼
         ┌────────────────┐                 ┌──────────────────┐
-        │ outbox: queued │  bridge picks → │ outbox: sent     │
-        └────────────────┘   it up         │ inbox: <created> │
+        │ outbox: queued │  bridge picks → │ outbox: sent     │ ── callback?
+        └────────────────┘   it up         │ inbox: <created> │     POST <callback_url>
                                             └──────────────────┘
-                                                    │
-                                                    │  callback_url set?
-                                                    ▼
-                                          POST <callback_url>
-
-   On error:
-        ┌────────────────┐
-        │ outbox: failed │   PATCH /api/webhooks/bridge { id, status: 'failed', error }
-        └────────────────┘
+        On error:  PATCH /api/webhooks/bridge { status: 'failed', error }
 ```
 
-`thread_id` joins prompts and responses that share an `external_ref`. The
-admin UI groups by thread; it doesn't care whether the prompts came from the
-admin form or an external app.
+`thread_id` joins prompts and responses sharing an `external_ref`.
 
 ---
 
-## External API
+## `POST /api/external/prompt`
 
-### `POST /api/external/prompt`
+Submit a prompt. Idempotent on `external_ref`: same value twice → same
+`thread_id`, second prompt becomes a follow-up.
 
-Submit a prompt. Idempotent on `external_ref`: passing the same value twice
-returns the same `thread_id`, so resending a request appends a follow-up
-prompt rather than creating a new thread.
+**Body**
 
-**Request**
-
-```http
-POST /api/external/prompt
-Content-Type: application/json
-x-external-secret: <EXTERNAL_API_SECRET>
-```
-
-```json
-{
-  "workspace":     "my-app",        // string, required
-  "prompt":        "...",           // string, required
-  "source":        "my-app",        // string, required — caller identifier
-  "external_ref":  "uuid-or-id",    // string, optional (auto-generated UUID if omitted)
-  "callback_url":  "https://...",   // string, optional, http(s) only
-  "title":         "...",           // string, optional, applied on first prompt only
-  "source_site":   "...",           // string, optional, free-form metadata
-  "source_bug_id": "..."            // string, optional, free-form metadata
-}
-```
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `workspace` | string | yes | Folder name on the bridge machine. |
+| `prompt` | string | yes | |
+| `source` | string | yes | Caller identifier. |
+| `external_ref` | string | no | Auto-generated UUID if omitted. |
+| `callback_url` | string | no | http(s); receives the response. |
+| `title` | string | no | Applied on first prompt of a thread only. |
+| `source_site`, `source_bug_id` | string | no | Free-form metadata. |
 
 **Response 200**
 
 ```json
-{
-  "ok": true,
-  "outbox_id":    "uuid",
-  "thread_id":    "uuid",
-  "external_ref": "...",
-  "status":       "queued",
-  "created_at":   "2026-04-30T08:15:32.821Z"
-}
+{ "ok": true, "outbox_id": "uuid", "thread_id": "uuid",
+  "external_ref": "...", "status": "queued", "created_at": "ISO8601" }
 ```
 
-**Errors**
+**Errors**: `400` (bad field), `401` (auth), `5xx` (server).
 
-| Status | Body |
-| --- | --- |
-| 400 | `{"error":"workspace, prompt, source required"}` |
-| 400 | `{"error":"callback_url must be http(s)"}` / `"... is not a valid URL"` |
-| 401 | `{"error":"Unauthorized"}` |
-| 500 | `{"error":"<message>"}` |
+---
 
-### `GET /api/external/messages`
+## `GET /api/external/messages`
 
-Polling alternative to callbacks. Returns prompts + responses interleaved by
-`created_at`.
+Polling alternative to callbacks.
 
-**Request**
-
-```http
-GET /api/external/messages?source=my-app&external_ref=...&since=...&limit=...&workspace=...
-x-external-secret: <EXTERNAL_API_SECRET>
-```
-
-| Query param | Required | Notes |
-| --- | --- | --- |
-| `source` | yes | Caller identifier set when submitting. |
-| `external_ref` | no | Narrow to a single thread. |
-| `workspace` | no | Narrow to a single workspace. |
-| `since` | no | ISO timestamp; only items strictly after this. |
-| `limit` | no | Default 100, max 500. |
+**Query**: `source` (required), `external_ref`, `workspace`, `since` (ISO),
+`limit` (default 100, max 500).
 
 **Response 200**
 
 ```json
-{
-  "items": [
-    {
-      "kind": "prompt",
-      "id": "uuid",
-      "workspace": "my-app",
-      "source": "my-app",
-      "external_ref": "...",
-      "content": "...",
-      "status": "sent",
-      "error": null,
-      "created_at": "...",
-      "sent_at": "..."
-    },
-    {
-      "kind": "response",
-      "id": "uuid",
-      "workspace": "my-app",
-      "source": "my-app",
-      "external_ref": "...",
-      "content": "...",
-      "claude_session_id": "...",
-      "created_at": "..."
-    }
-  ]
-}
+{ "items": [
+  { "kind": "prompt",   "id": "...", "content": "...", "status": "sent", "created_at": "..." },
+  { "kind": "response", "id": "...", "content": "...", "created_at": "..." }
+] }
 ```
 
-### Callback (server → caller)
+Sorted by `created_at` ascending across both kinds.
 
-When the inbound prompt included `callback_url`, the web app fires a
-fire-and-forget POST to that URL after the response is recorded.
+---
 
-```http
+## Callback (server → caller)
+
+If the inbound prompt set `callback_url`, fired fire-and-forget after the
+response lands.
+
+```
 POST <callback_url>
-Content-Type: application/json
 x-external-secret: <EXTERNAL_API_SECRET>
 ```
 
 ```json
-{
-  "inbox_id":          "uuid",
-  "workspace":         "my-app",
-  "source":            "my-app",
-  "external_ref":      "...",
-  "response":          "...",
-  "claude_session_id": "...",
-  "created_at":        "...",
-  "conversation_id":   null
-}
+{ "inbox_id": "uuid", "workspace": "...", "source": "...",
+  "external_ref": "...", "response": "...", "claude_session_id": "...",
+  "created_at": "...", "conversation_id": null }
 ```
 
-The callback is best-effort. If your endpoint is down, the inbox row is still
-the source of truth — clients should also support `GET /api/external/messages`
-as a recovery path.
+Best-effort. The inbox row is the source of truth — clients should also
+support `GET /api/external/messages` as a recovery path.
 
 ---
 
-## QA assistant
+## `POST /api/qa-assistant`
 
-### `POST /api/qa-assistant`
-
-Used by a Chrome extension to submit a bug report with page context. Same
-underlying queue as `/api/external/prompt`, but auth is `Bearer` and the body
-shape is fixed.
-
-```http
-POST /api/qa-assistant
-Content-Type: application/json
-Authorization: Bearer <EXTERNAL_API_SECRET>
-```
+Same backend as `/api/external/prompt`, fixed body, `Bearer` auth.
 
 ```json
 {
-  "prompt":     "Login button doesn't work on Safari iOS.",
-  "workspace":  "my-app",          // optional; falls back to QA_DEFAULT_WORKSPACE env
-  "url":        "https://...",     // optional, included in the formatted prompt
-  "screenshot": "data:image/png;base64,...",  // optional, stored as JSON attachment
-  "consoleLog": "..."              // optional, last ~4KB injected into the prompt
+  "prompt":     "...",                          // required
+  "workspace":  "my-app",                       // optional, falls back to QA_DEFAULT_WORKSPACE
+  "url":        "https://...",                  // optional, prepended to prompt
+  "screenshot": "data:image/png;base64,...",   // optional, stored as JSON attachment
+  "consoleLog": "..."                           // optional, last ~4KB injected into prompt
 }
 ```
 
-Response: `{"ok": true, "response": "Sent. ...", "thread_id": "uuid"}`.
+Response: `{ "ok": true, "thread_id": "uuid" }`.
 
 ---
 
-## Bridge ↔ web app
+## Bridge ↔ web app — `/api/webhooks/bridge`
 
-Three operations on a single endpoint, distinguished by HTTP method.
+Three operations on one path, by HTTP method. All three: `x-bridge-secret`.
 
-### `POST /api/webhooks/bridge`
-
-The bridge calls this to deliver Claude's response. Matches it to the most
-recent outbox row in the same workspace.
-
-```http
-POST /api/webhooks/bridge
-Content-Type: application/json
-x-bridge-secret: <BRIDGE_SECRET>
-```
+### `POST` — deliver Claude's response
 
 ```json
-{
-  "workspace":         "my-app",   // required, routes the response
-  "response":          "...",      // required
-  "claude_session_id": "...",      // optional
-  "conversation_id":   null         // optional, reserved for clients that track sessions
-}
+{ "workspace": "my-app", "response": "...",
+  "claude_session_id": "...",  // optional
+  "conversation_id":   null }   // optional, reserved
 ```
 
-Response: `{"ok": true, "id": "<inbox-row-uuid>"}`.
+Side effects: inserts `claude_inbox` row (pulling `thread_id`/`source`/
+`external_ref` from the most-recent matching outbox row in the same
+workspace), updates `claude_threads.last_at`, fires callback if set.
 
-Side effects:
-- Inserts a `claude_inbox` row pulling `thread_id`, `source`, `external_ref`
-  from the matched outbox row.
-- Updates the matching `claude_threads` row's `last_at`; if status was
-  `pending`, flips to `completed`.
-- If the outbox row had a `callback_url`, fires the callback.
+### `GET ?status=queued` — polling fallback
 
-### `GET /api/webhooks/bridge?status=queued`
+Returns up to 20 oldest queued outbox rows. Bridge runs this at startup
+(catchup). Response: `{ "items": [{ id, workspace, prompt, created_at }] }`.
 
-Polling fallback for the bridge. Returns up to 20 oldest queued outbox rows.
-
-```http
-GET /api/webhooks/bridge?status=queued
-x-bridge-secret: <BRIDGE_SECRET>
-```
-
-Response:
+### `PATCH` — mark outbox row sent/failed
 
 ```json
-{
-  "items": [
-    { "id": "uuid", "workspace": "my-app", "prompt": "...", "created_at": "..." }
-  ]
-}
+{ "id": "uuid", "status": "sent" | "failed", "error": "stderr" }
 ```
 
-The bridge runs this once at startup (catchup), then relies on the fast push
-to `/inject` for new items. Optional: poll periodically as a heartbeat.
-
-### `PATCH /api/webhooks/bridge`
-
-Updates an outbox row's status. The bridge sends this after `claude --print`
-returns (success or failure).
-
-```http
-PATCH /api/webhooks/bridge
-Content-Type: application/json
-x-bridge-secret: <BRIDGE_SECRET>
-```
-
-```json
-{
-  "id":     "uuid",            // outbox row id
-  "status": "sent" | "failed", // required
-  "error":  "stderr message"   // optional, recorded only on failure
-}
-```
-
-`status: "sent"` also sets `sent_at = NOW()`.
+`status: "sent"` also stamps `sent_at`.
 
 ---
 
 ## Bridge `/inject`
 
-Endpoint exposed **by the bridge**, not the web app. Used by the web app to
-push fresh prompts to the bridge so it doesn't have to poll.
+**Exposed by the bridge**, not the web app. Web app pushes here so the bridge
+doesn't have to poll.
 
-```http
+```
 POST <BRIDGE_PUSH_URL>/inject
-Content-Type: application/json
 x-bridge-secret: <BRIDGE_SECRET>
 ```
 
 ```json
-{
-  "id":              "uuid",       // outbox row id, optional but recommended
-  "workspace":       "my-app",     // required
-  "prompt":          "...",        // required
-  "conversation_id": null           // optional
-}
+{ "id": "uuid", "workspace": "my-app", "prompt": "...",
+  "conversation_id": null }
 ```
 
-The bridge replies `202` immediately and processes asynchronously (spawn
-Claude → POST inbox → PATCH outbox). If the bridge is unreachable, the web
-app still inserted the outbox row, so the bridge's next catchup or polling
-pass picks it up. Best-effort, no retries from the web side.
+Bridge replies `202` immediately and processes async. Best-effort: if the
+push fails, the queued outbox row stays put for the next catchup.
 
 ---
 
-## Admin API (web UI internals)
+## Cron — `/api/cron/scheduled-tasks`
 
-Auth: `claude_admin` cookie, set by `POST /api/auth/login` with the
-`ADMIN_TOKEN`.
+`GET` or `POST`. Auth (any one): `?secret=<CRON_SECRET>`,
+`Authorization: Bearer <CRON_SECRET>`, or `x-vercel-cron: 1`.
 
-| Method + path | Purpose |
-| --- | --- |
-| `POST /api/admin/send` | Submit a new admin-side prompt. |
-| `GET /api/admin/threads` | List threads (most recent first). |
-| `GET /api/admin/threads/:id` | Thread detail with interleaved messages. |
-| `PATCH /api/admin/threads/:id` | Update title/status. |
-| `GET /api/admin/scheduled` | List scheduled tasks. |
-| `POST /api/admin/scheduled` | Create a scheduled task. |
-| `PATCH /api/admin/scheduled/:id` | Update / toggle enabled. |
-| `DELETE /api/admin/scheduled/:id` | Delete a scheduled task. |
+Fires due tasks (`enabled = TRUE AND next_run_at <= NOW()`), reschedules
+recurring ones, disables completed one-off tasks. Hit it at least as often
+as your shortest interval. Free schedulers: cron-job.org, Cloudflare Workers
+cron, GitHub Actions `schedule:`.
 
-Admin endpoints are not part of the public protocol — they're for the
-included UI. Browse `app/api/admin/` for shapes.
+Response: `{ "ok": true, "fired": N, "results": [...] }`.
 
 ---
 
-## Cron
+## Admin API
 
-### `GET|POST /api/cron/scheduled-tasks`
-
-Fires any scheduled tasks whose `next_run_at` has passed and reschedules
-them. Auth via any of:
-
-- `?secret=<CRON_SECRET>`
-- `Authorization: Bearer <CRON_SECRET>`
-- `x-vercel-cron: 1` (legacy compatibility)
-
-External cron services that work:
-- [cron-job.org](https://cron-job.org) — free, simple, hits a URL on a schedule.
-- Cloudflare Workers cron triggers.
-- GitHub Actions on a `schedule:` trigger.
-
-Resolution is `cron interval`. If you want minute-level firing, hit this
-route once a minute.
-
-Response: `{"ok": true, "fired": <count>, "results": [{ id, ok, outbox_id, next_run_at }]}`.
+`POST /api/auth/login { token }` sets the `claude_admin` cookie. The other
+admin routes (`/api/admin/send`, `/api/admin/threads(/:id)`,
+`/api/admin/scheduled(/:id)`) are internal to the included UI — see
+`app/api/admin/` for shapes.
