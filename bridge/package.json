@@ -1,0 +1,13 @@
+{
+  "name": "claude-bridge-server",
+  "version": "1.0.0",
+  "description": "Local-machine bridge that runs `claude --print` and ferries prompts/responses to a deployed claude-bridge web app.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.0.0"
+  }
+}

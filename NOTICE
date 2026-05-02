@@ -1,0 +1,19 @@
+claude-bridge
+Copyright 2026 Iddo Froom
+
+This product includes ideas and patterns from the following projects:
+
+  ccgram (https://github.com/JessyTsui/ccgram), MIT License
+    Copyright (c) 2025 JessyTsui
+
+  The bridge/ implementation in this repository is adapted from the
+  internal bridge component used in iddofroom/meeting-copilot, which itself
+  drew on the ccgram architecture.
+
+The naming conventions for the wire protocol (the "bridge" terminology
+and the queued/sent/failed outbox pattern) trace back to the original
+ccgram design. Where this project diverges — schema names, the standalone
+Next.js admin UI, the scheduling layer, and the external callback API —
+the implementation is original.
+
+See LICENSE for the terms under which this software is distributed.

@@ -1,36 +1,109 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# claude-bridge
 
-## Getting Started
+Remote-control your Claude Code session from anywhere.
 
-First, run the development server:
+You run **Claude Code** on one machine (a desktop, a home server, anything that
+keeps a long-lived shell). You deploy this Next.js app somewhere with a public
+URL. The two halves talk through a Postgres outbox + a tiny bridge process,
+so:
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+- You can compose prompts in a web dashboard and they show up in Claude as if
+  you had typed them locally.
+- You can schedule prompts to fire daily / weekly / monthly / once.
+- Other apps you own can POST a prompt through a shared-secret API and get the
+  response back via webhook callback or polling.
+- A QA Chrome extension can submit a bug report (with screenshot + console
+  log) and watch Claude work on it.
+
+## Architecture
+
+```
+  ┌──────────────┐   POST prompt    ┌──────────────────┐   spawn        ┌──────────────┐
+  │ external app │ ───────────────► │  Next.js +       │ ─ inject ────► │ bridge       │ ─► claude --print
+  │  /  admin UI │ ◄─── callback ── │  Postgres outbox │ ◄─ catchup ─── │ (your home)  │ ◄─ stdout
+  └──────────────┘                  └──────────────────┘                └──────────────┘
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Three independent pieces:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+1. **Web app** (this repo's root) — Next.js admin UI + REST endpoints, auth
+   gated by a single `ADMIN_TOKEN`. Runs on Netlify, Vercel, or anywhere that
+   speaks Node.
+2. **Postgres** — Neon works out of the box. Four tables (threads / outbox /
+   inbox / scheduled\_tasks).
+3. **Bridge** ([`bridge/`](bridge/)) — tiny Node script that runs on the
+   machine where Claude Code is installed. Receives prompts, runs
+   `claude --print` in the right workspace folder, posts the answer back.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Quickstart (~15 minutes)
 
-## Learn More
+```bash
+git clone https://github.com/iddofroom/claude-bridge.git
+cd claude-bridge
+npm install
 
-To learn more about Next.js, take a look at the following resources:
+# 1. Provision a Postgres DB (e.g. on neon.tech) and grab the connection string.
+# 2. Generate three random secrets:
+openssl rand -hex 32   # ADMIN_TOKEN
+openssl rand -hex 32   # BRIDGE_SECRET
+openssl rand -hex 32   # EXTERNAL_API_SECRET (and CRON_SECRET — can be the same value)
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+cp .env.example .env.local
+# Fill in DATABASE_URL, ADMIN_TOKEN, BRIDGE_SECRET, EXTERNAL_API_SECRET, CRON_SECRET.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+npm run db:migrate
+npm run dev          # http://localhost:3000 → /login → enter ADMIN_TOKEN
+```
 
-## Deploy on Vercel
+Then set up the bridge — see [BRIDGE.md](BRIDGE.md). Five-minute job: install
+deps, copy the same `BRIDGE_SECRET`, run `node server.js`, expose port 7777
+through a Cloudflare Tunnel.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Documentation
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| File | What it covers |
+| --- | --- |
+| [BRIDGE.md](BRIDGE.md) | Setting up the home-machine bridge, including running it as a service. |
+| [INTEGRATE.md](INTEGRATE.md) | How to wire your other apps into this one — TypeScript + Python examples. |
+| [PROTOCOL.md](PROTOCOL.md) | Full wire-protocol spec for anyone reimplementing the bridge in another language. |
+| `/admin/claude-bot/guide` | A condensed in-app version of the integration guide. |
+
+## What's running on each side?
+
+Web app endpoints:
+
+| Path | Purpose | Auth |
+| --- | --- | --- |
+| `/admin/claude-bot` | Web UI — compose prompts, see threads. | `ADMIN_TOKEN` cookie |
+| `/admin/claude-bot/scheduled` | CRUD for scheduled prompts. | `ADMIN_TOKEN` cookie |
+| `POST /api/external/prompt` | Submit a prompt from another app. | `EXTERNAL_API_SECRET` |
+| `GET /api/external/messages` | Poll the prompt + response feed. | `EXTERNAL_API_SECRET` |
+| `POST /api/qa-assistant` | Bug-report intake from a QA browser extension. | `Bearer EXTERNAL_API_SECRET` |
+| `*/api/webhooks/bridge` | Bridge ↔ web app — POST inbox, GET queued, PATCH status. | `BRIDGE_SECRET` |
+| `GET /api/cron/scheduled-tasks` | Fire any scheduled tasks whose time has come. | `CRON_SECRET` |
+
+## Deployment
+
+Default target is **Netlify** (`netlify.toml` is included; auto-detected
+`@netlify/plugin-nextjs`). It works on Vercel, Render, Fly, etc. — anywhere
+that runs Next.js. There's no `vercel.json` because scheduled tasks are
+triggered by an **external** cron service hitting `/api/cron/scheduled-tasks`,
+not Vercel cron.
+
+Set every env var from `.env.example` in your hosting provider's panel. Run
+`npm run db:migrate` once against the production DB.
+
+## Security
+
+- The web app **only** authenticates via three secrets. Lose one, rotate it.
+- The bridge listens on `127.0.0.1` by default. Expose it to the internet only
+  through a tunnel (Cloudflare Tunnel, ngrok, Tailscale Funnel) — never bind
+  to `0.0.0.0`.
+- Anyone with `EXTERNAL_API_SECRET` can run arbitrary prompts in your Claude
+  session. Treat it like an SSH key.
+- `claude --print` runs with the bridge process's permissions. Don't run the
+  bridge as root.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Attribution to upstream projects in [NOTICE](NOTICE).
