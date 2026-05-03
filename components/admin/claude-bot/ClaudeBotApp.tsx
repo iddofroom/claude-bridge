@@ -169,7 +169,7 @@ export default function ClaudeBotApp({
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as ThreadDetail;
       setDetail(data);
-      setWorkspace((current) => current || data.thread.workspace);
+      setWorkspace(data.thread.workspace);
     } catch (err) {
       setDetail(null);
       setError(err instanceof Error ? err.message : String(err));
@@ -249,6 +249,8 @@ export default function ClaudeBotApp({
     setActiveId(null);
     setDetail(null);
     setPrompt("");
+    const last = localStorage.getItem(LAST_WORKSPACE_KEY) || "";
+    setWorkspace(last);
     composerRef.current?.focus();
   }, []);
 
