@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 export type ThreadSummary = {
   id: string;
@@ -98,6 +98,7 @@ export default function ClaudeBotApp({
   const [notifPermission, setNotifPermission] =
     useState<NotificationPermissionState>("default");
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
   // Snapshot of response_count per thread on the previous poll. When the next
   // poll shows a higher count, that thread just received a new Claude reply
   // and we fire a desktop notification (if granted).
@@ -195,6 +196,12 @@ export default function ClaudeBotApp({
   useEffect(() => {
     if (activeId) loadDetail(activeId);
   }, [activeId, loadDetail]);
+
+  // Auto-scroll to the newest message whenever the active thread or its
+  // message count changes.
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ block: "end" });
+  }, [activeId, detail?.messages.length]);
 
   // Poll the active thread for new responses + thread list for cross-thread
   // updates. Cheap because it only hits our local DB.
@@ -367,6 +374,7 @@ export default function ClaudeBotApp({
                 )}
             </>
           ) : null}
+          <div ref={messagesEndRef} />
         </div>
 
         <div className="border-t border-zinc-800 bg-zinc-900 p-3 space-y-2">
@@ -439,6 +447,44 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
+// Splits message text into plain strings and <a> tags for any http(s) URL.
+// Trailing punctuation like ).,;! is excluded from the link so a URL at the
+// end of a sentence still produces a clean target.
+const URL_REGEX = /(https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"])/g;
+
+function linkify(text: string): ReactNode {
+  if (!text) return text;
+  const parts: ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+  URL_REGEX.lastIndex = 0;
+  while ((match = URL_REGEX.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(
+        <Fragment key={`t-${key++}`}>{text.slice(lastIndex, match.index)}</Fragment>,
+      );
+    }
+    const url = match[0];
+    parts.push(
+      <a
+        key={`l-${key++}`}
+        href={url}
+        target="_blank"
+        rel="noreferrer noopener"
+        className="underline break-all hover:opacity-80"
+      >
+        {url}
+      </a>,
+    );
+    lastIndex = URL_REGEX.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    parts.push(<Fragment key={`t-${key++}`}>{text.slice(lastIndex)}</Fragment>);
+  }
+  return parts;
+}
+
 function MessageBubble({ m }: { m: Message }) {
   const isPrompt = m.kind === "prompt";
   const attachments = m.attachments;
@@ -455,7 +501,7 @@ function MessageBubble({ m }: { m: Message }) {
             : "bg-zinc-800 text-zinc-100"
         }`}
       >
-        <div>{m.content}</div>
+        <div>{linkify(m.content)}</div>
         {hasScreenshot && (
           <a
             href={attachments!.screenshot!}
