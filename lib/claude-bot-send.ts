@@ -19,32 +19,39 @@ export type EnqueueResult = {
 export async function enqueueClaudeBotPrompt(
   opts: EnqueueOptions,
 ): Promise<EnqueueResult> {
-  const { workspace, prompt, title, threadId, source } = opts;
+  const { prompt, title, threadId, source } = opts;
 
   let resolvedThreadId: string;
   let externalRef: string;
+  // A thread is bound to a single workspace for its lifetime. When continuing
+  // an existing thread the caller's workspace is ignored — we use whatever
+  // the thread was created with — so a stale UI state can never silently
+  // re-route the conversation to a different folder on the bridge machine.
+  let resolvedWorkspace: string;
 
   if (threadId) {
     const rows = (await sql`
-      SELECT id, external_ref FROM claude_threads WHERE id = ${threadId} LIMIT 1
-    `) as Array<{ id: string; external_ref: string }>;
+      SELECT id, external_ref, workspace
+      FROM claude_threads WHERE id = ${threadId} LIMIT 1
+    `) as Array<{ id: string; external_ref: string; workspace: string }>;
     if (rows.length === 0) {
       throw new Error("thread_not_found");
     }
     resolvedThreadId = rows[0].id;
     externalRef = rows[0].external_ref;
+    resolvedWorkspace = rows[0].workspace;
     await sql`
       UPDATE claude_threads
       SET last_at = NOW(),
-          status = CASE WHEN status = 'completed' THEN 'pending' ELSE status END,
-          workspace = ${workspace}
+          status = CASE WHEN status = 'completed' THEN 'pending' ELSE status END
       WHERE id = ${resolvedThreadId}
     `;
   } else {
     externalRef = crypto.randomUUID();
+    resolvedWorkspace = opts.workspace;
     const created = (await sql`
       INSERT INTO claude_threads (external_ref, workspace, title, status, source)
-      VALUES (${externalRef}, ${workspace}, ${title ?? null}, 'pending', ${source})
+      VALUES (${externalRef}, ${resolvedWorkspace}, ${title ?? null}, 'pending', ${source})
       RETURNING id
     `) as Array<{ id: string }>;
     resolvedThreadId = created[0].id;
@@ -55,7 +62,7 @@ export async function enqueueClaudeBotPrompt(
       workspace, prompt, status, source, external_ref, thread_id
     )
     VALUES (
-      ${workspace}, ${prompt}, 'queued',
+      ${resolvedWorkspace}, ${prompt}, 'queued',
       ${source}, ${externalRef}, ${resolvedThreadId}
     )
     RETURNING id, created_at
@@ -64,7 +71,7 @@ export async function enqueueClaudeBotPrompt(
 
   pushToBridge({
     outboxId,
-    workspace,
+    workspace: resolvedWorkspace,
     prompt,
     conversationId: null,
   });
