@@ -9,6 +9,7 @@ export async function pushToBridge(payload: {
   workspace: string;
   prompt: string;
   conversationId?: string | null;
+  parentSessionId?: string | null;
 }): Promise<void> {
   const url = process.env.BRIDGE_PUSH_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -25,6 +26,7 @@ export async function pushToBridge(payload: {
         workspace: payload.workspace,
         prompt: payload.prompt,
         conversation_id: payload.conversationId ?? null,
+        parent_session_id: payload.parentSessionId ?? null,
       }),
       signal: controller.signal,
     });

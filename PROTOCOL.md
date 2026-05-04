@@ -135,7 +135,11 @@ workspace), updates `claude_threads.last_at`, fires callback if set.
 ### `GET ?status=queued` — polling fallback
 
 Returns up to 20 oldest queued outbox rows. Bridge runs this at startup
-(catchup). Response: `{ "items": [{ id, workspace, prompt, created_at }] }`.
+(catchup). Response: `{ "items": [{ id, workspace, prompt, parent_session_id, created_at }] }`.
+
+`parent_session_id` is the Claude session id from the previous turn on the
+same thread (or `null` for a fresh thread). The bridge passes it to
+`claude --print --resume <id>` to continue the conversation with memory.
 
 ### `PATCH` — mark outbox row sent/failed
 
@@ -159,8 +163,13 @@ x-bridge-secret: <BRIDGE_SECRET>
 
 ```json
 { "id": "uuid", "workspace": "my-app", "prompt": "...",
-  "conversation_id": null }
+  "parent_session_id": null,
+  "conversation_id":   null }
 ```
+
+`parent_session_id`, when set, tells the bridge to run
+`claude --print --resume <id>` so the new prompt continues the previous
+turn's conversation.
 
 Bridge replies `202` immediately and processes async. Best-effort: if the
 push fails, the queued outbox row stays put for the next catchup.

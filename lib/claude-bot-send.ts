@@ -28,6 +28,10 @@ export async function enqueueClaudeBotPrompt(
   // the thread was created with — so a stale UI state can never silently
   // re-route the conversation to a different folder on the bridge machine.
   let resolvedWorkspace: string;
+  // session_id of the previous turn on this thread, if any. The bridge passes
+  // this to `claude --resume <id>` so the conversation continues with memory
+  // of what was said before.
+  let parentSessionId: string | null = null;
 
   if (threadId) {
     const rows = (await sql`
@@ -40,6 +44,12 @@ export async function enqueueClaudeBotPrompt(
     resolvedThreadId = rows[0].id;
     externalRef = rows[0].external_ref;
     resolvedWorkspace = rows[0].workspace;
+    const sessionRows = (await sql`
+      SELECT claude_session_id FROM claude_inbox
+      WHERE thread_id = ${resolvedThreadId} AND claude_session_id IS NOT NULL
+      ORDER BY created_at DESC LIMIT 1
+    `) as Array<{ claude_session_id: string | null }>;
+    parentSessionId = sessionRows[0]?.claude_session_id ?? null;
     await sql`
       UPDATE claude_threads
       SET last_at = NOW(),
@@ -59,11 +69,11 @@ export async function enqueueClaudeBotPrompt(
 
   const outRows = (await sql`
     INSERT INTO claude_outbox (
-      workspace, prompt, status, source, external_ref, thread_id
+      workspace, prompt, status, source, external_ref, thread_id, parent_session_id
     )
     VALUES (
       ${resolvedWorkspace}, ${prompt}, 'queued',
-      ${source}, ${externalRef}, ${resolvedThreadId}
+      ${source}, ${externalRef}, ${resolvedThreadId}, ${parentSessionId}
     )
     RETURNING id, created_at
   `) as Array<{ id: string; created_at: string }>;
@@ -74,6 +84,7 @@ export async function enqueueClaudeBotPrompt(
     workspace: resolvedWorkspace,
     prompt,
     conversationId: null,
+    parentSessionId,
   });
 
   return {

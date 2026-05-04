@@ -45,14 +45,17 @@ async function migrate() {
       error          TEXT,
       created_at     TIMESTAMPTZ DEFAULT NOW(),
       sent_at        TIMESTAMPTZ,
-      thread_id      UUID REFERENCES claude_threads(id) ON DELETE SET NULL,
-      source         TEXT,
-      external_ref   TEXT,
-      callback_url   TEXT,
-      attachments    JSONB
+      thread_id          UUID REFERENCES claude_threads(id) ON DELETE SET NULL,
+      source             TEXT,
+      external_ref       TEXT,
+      callback_url       TEXT,
+      attachments        JSONB,
+      parent_session_id  TEXT
     )
   `;
   console.log("  ✓ claude_outbox");
+  // Idempotent for installs that ran the v0 migration before parent_session_id existed.
+  await sql`ALTER TABLE claude_outbox ADD COLUMN IF NOT EXISTS parent_session_id TEXT`;
   await sql`CREATE INDEX IF NOT EXISTS idx_claude_outbox_status ON claude_outbox(status, created_at)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_claude_outbox_thread ON claude_outbox(thread_id, created_at)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_claude_outbox_external_ref ON claude_outbox(external_ref)`;

@@ -7,10 +7,12 @@
  *   1. Web app inserts a queued row in claude_outbox and POSTs to
  *      {tunnel-url}/inject (this server, exposed via Cloudflare Tunnel /
  *      ngrok / Tailscale).
- *   2. We spawn `claude --print` in the matching workspace dir, pipe the
- *      prompt to stdin, collect stdout.
- *   3. POST the response to {WEB_APP_URL}/api/webhooks/bridge so it lands in
- *      claude_inbox and reaches the browser dashboard.
+ *   2. We spawn `claude --print --output-format json` in the matching
+ *      workspace dir. If the request carries parent_session_id, we add
+ *      `--resume <id>` so the conversation continues with memory.
+ *   3. POST the response to {WEB_APP_URL}/api/webhooks/bridge — the JSON
+ *      output gives us both the response text and the new session_id, which
+ *      the web app stores so the next prompt on this thread can resume.
  *   4. PATCH the outbox row to 'sent' (or 'failed') so the UI knows.
  *
  * On startup we run a one-shot catchup against the queued outbox so any rows
@@ -59,29 +61,49 @@ function findProjectDir(workspace) {
   return target;
 }
 
-function runClaude(cwd, prompt) {
+function runClaude(cwd, prompt, parentSessionId) {
   return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_BIN, ['--print'], { cwd, shell: true });
+    const args = ['--print', '--output-format', 'json'];
+    if (parentSessionId) args.push('--resume', parentSessionId);
+    const child = spawn(CLAUDE_BIN, args, { cwd, shell: true });
     let out = '';
     let err = '';
     child.stdout.on('data', (c) => (out += c.toString()));
     child.stderr.on('data', (c) => (err += c.toString()));
     child.on('error', reject);
     child.on('close', (code) => {
-      if (code === 0) resolve(out.trim());
-      else reject(new Error(`claude exited ${code}: ${err.trim()}`));
+      if (code !== 0) {
+        reject(new Error(`claude exited ${code}: ${err.trim()}`));
+        return;
+      }
+      const trimmed = out.trim();
+      try {
+        const parsed = JSON.parse(trimmed);
+        const text = typeof parsed.result === 'string' ? parsed.result : trimmed;
+        const sessionId =
+          typeof parsed.session_id === 'string' ? parsed.session_id : null;
+        resolve({ text, sessionId });
+      } catch {
+        // Fallback: plain-text output. No session id captured this turn.
+        resolve({ text: trimmed, sessionId: null });
+      }
     });
     child.stdin.write(prompt);
     child.stdin.end();
   });
 }
 
-async function postInbox(workspace, response, conversationId) {
+async function postInbox(workspace, response, sessionId, conversationId) {
   const url = new URL('/api/webhooks/bridge', WEB_APP_URL);
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-bridge-secret': PUSH_SECRET },
-    body: JSON.stringify({ workspace, response, conversation_id: conversationId ?? null }),
+    body: JSON.stringify({
+      workspace,
+      response,
+      claude_session_id: sessionId ?? null,
+      conversation_id: conversationId ?? null,
+    }),
   });
   if (!res.ok) console.warn('[bridge] inbox post failed:', res.status, await res.text());
 }
@@ -96,14 +118,21 @@ async function patchOutbox(id, status, error) {
   if (!res.ok) console.warn('[bridge] outbox patch failed:', res.status, await res.text());
 }
 
-async function processItem({ id: outboxId, workspace, prompt, conversation_id }) {
-  console.log(`[bridge] inject → ${workspace} (${prompt.slice(0, 60).replace(/\s+/g, ' ')}…)`);
+async function processItem({
+  id: outboxId,
+  workspace,
+  prompt,
+  conversation_id,
+  parent_session_id,
+}) {
+  const resumeNote = parent_session_id ? ` (resume ${parent_session_id.slice(0, 8)}…)` : '';
+  console.log(`[bridge] inject → ${workspace}${resumeNote} (${prompt.slice(0, 60).replace(/\s+/g, ' ')}…)`);
   const cwd = findProjectDir(workspace);
   try {
-    const response = await runClaude(cwd, prompt);
-    await postInbox(workspace, response, conversation_id);
+    const { text, sessionId } = await runClaude(cwd, prompt, parent_session_id);
+    await postInbox(workspace, text, sessionId, conversation_id);
     if (outboxId) await patchOutbox(outboxId, 'sent');
-    console.log(`[bridge] done → ${workspace}`);
+    console.log(`[bridge] done → ${workspace}${sessionId ? ` (session ${sessionId.slice(0, 8)}…)` : ''}`);
   } catch (err) {
     console.error(`[bridge] failed → ${workspace}: ${err.message}`);
     if (outboxId) await patchOutbox(outboxId, 'failed', err.message);
