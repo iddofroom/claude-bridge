@@ -50,6 +50,10 @@ export async function POST(req: Request) {
     const sourceBugId = body.source_bug_id
       ? body.source_bug_id.toString().trim()
       : null;
+    // How much capability the spawned Claude session gets. 'read_only' = the
+    // bridge restricts it to reads + JSON output (untrusted-input sessions).
+    // Anything else ⇒ NULL ⇒ full (unchanged default; matches the Sentry flow).
+    const permissionMode = body.permission_mode === "read_only" ? "read_only" : null;
 
     if (!workspace || !prompt || !source) {
       return NextResponse.json(
@@ -106,11 +110,11 @@ export async function POST(req: Request) {
 
     const rows = await sql`
       INSERT INTO claude_outbox (
-        workspace, prompt, status, source, external_ref, callback_url, thread_id
+        workspace, prompt, status, source, external_ref, callback_url, thread_id, permission_mode
       )
       VALUES (
         ${workspace}, ${prompt}, 'queued',
-        ${source}, ${externalRef}, ${callbackUrl}, ${threadId}
+        ${source}, ${externalRef}, ${callbackUrl}, ${threadId}, ${permissionMode}
       )
       RETURNING id, status, created_at
     `;
@@ -120,6 +124,7 @@ export async function POST(req: Request) {
       workspace,
       prompt,
       conversationId: null,
+      permissionMode,
     });
 
     return NextResponse.json({

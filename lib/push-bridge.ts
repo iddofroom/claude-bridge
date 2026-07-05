@@ -10,6 +10,7 @@ export async function pushToBridge(payload: {
   prompt: string;
   conversationId?: string | null;
   parentSessionId?: string | null;
+  permissionMode?: string | null;
 }): Promise<void> {
   const url = process.env.BRIDGE_PUSH_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -27,6 +28,7 @@ export async function pushToBridge(payload: {
         prompt: payload.prompt,
         conversation_id: payload.conversationId ?? null,
         parent_session_id: payload.parentSessionId ?? null,
+        permission_mode: payload.permissionMode ?? null,
       }),
       signal: controller.signal,
     });

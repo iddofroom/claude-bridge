@@ -56,6 +56,9 @@ async function migrate() {
   console.log("  ✓ claude_outbox");
   // Idempotent for installs that ran the v0 migration before parent_session_id existed.
   await sql`ALTER TABLE claude_outbox ADD COLUMN IF NOT EXISTS parent_session_id TEXT`;
+  // permission_mode: 'read_only' ⇒ the bridge spawns claude with plan-mode + no
+  // write/shell/web tools (untrusted-input sessions). NULL/'full' ⇒ unrestricted.
+  await sql`ALTER TABLE claude_outbox ADD COLUMN IF NOT EXISTS permission_mode TEXT`;
   await sql`CREATE INDEX IF NOT EXISTS idx_claude_outbox_status ON claude_outbox(status, created_at)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_claude_outbox_thread ON claude_outbox(thread_id, created_at)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_claude_outbox_external_ref ON claude_outbox(external_ref)`;

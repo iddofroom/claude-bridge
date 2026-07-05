@@ -110,7 +110,7 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
   const rows = await sql`
-    SELECT id, workspace, prompt, parent_session_id, created_at
+    SELECT id, workspace, prompt, parent_session_id, permission_mode, created_at
     FROM claude_outbox
     WHERE status = 'queued'
     ORDER BY created_at ASC

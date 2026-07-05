@@ -61,9 +61,20 @@ function findProjectDir(workspace) {
   return target;
 }
 
-function runClaude(cwd, prompt, parentSessionId) {
+function runClaude(cwd, prompt, parentSessionId, permissionMode) {
   return new Promise((resolve, reject) => {
     const args = ['--print', '--output-format', 'json'];
+    if (permissionMode === 'read_only') {
+      // Untrusted-input sessions (CS drafts / manager triage): plan-mode + no
+      // write/shell/web tools — the model only reads context and returns JSON, so
+      // a prompt-injection in the untrusted text cannot take any action. Trusted
+      // human-triggered sessions (execute / Sentry) send no permission_mode ⇒
+      // unrestricted, unchanged.
+      args.push(
+        '--permission-mode', 'plan',
+        '--disallowedTools', 'Write,Edit,NotebookEdit,Bash,WebFetch,WebSearch',
+      );
+    }
     if (parentSessionId) args.push('--resume', parentSessionId);
     const child = spawn(CLAUDE_BIN, args, { cwd, shell: true });
     let out = '';
@@ -124,12 +135,14 @@ async function processItem({
   prompt,
   conversation_id,
   parent_session_id,
+  permission_mode,
 }) {
   const resumeNote = parent_session_id ? ` (resume ${parent_session_id.slice(0, 8)}…)` : '';
-  console.log(`[bridge] inject → ${workspace}${resumeNote} (${prompt.slice(0, 60).replace(/\s+/g, ' ')}…)`);
+  const modeNote = permission_mode === 'read_only' ? ' [read-only]' : '';
+  console.log(`[bridge] inject → ${workspace}${resumeNote}${modeNote} (${prompt.slice(0, 60).replace(/\s+/g, ' ')}…)`);
   const cwd = findProjectDir(workspace);
   try {
-    const { text, sessionId } = await runClaude(cwd, prompt, parent_session_id);
+    const { text, sessionId } = await runClaude(cwd, prompt, parent_session_id, permission_mode);
     await postInbox(workspace, text, sessionId, conversation_id);
     if (outboxId) await patchOutbox(outboxId, 'sent');
     console.log(`[bridge] done → ${workspace}${sessionId ? ` (session ${sessionId.slice(0, 8)}…)` : ''}`);
