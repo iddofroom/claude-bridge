@@ -35,6 +35,12 @@
  *                           MUST stay > Neon's 5-min autosuspend so Neon idles.
  *   WS_PING_MS              default 30000. Keep-alive ping to detect a dead socket.
  *   CLAUDE_TIMEOUT_MS       default 180000  (kill a stuck run)
+ *   CLAUDE_MODEL            default "claude-fable-5-1". Passed as `--model <value>`.
+ *                           Set to "" (empty string) to omit the flag and fall back
+ *                           to the CLI's own default model. NOT verified end-to-end
+ *                           against this machine's installed `claude` CLI version —
+ *                           confirm `claude --help` still shows `--model` before
+ *                           relying on it; if the flag name changed, override here.
  *   WORKSPACE_ALLOWLIST     default "" (empty = any workspace with a matching dir)
  *   SOURCE_ALLOWLIST        default "" (empty = any source). For a SAFE first test set to
  *                           bakbukim-cs-draft,bakbukim-manager-triage,bakbukim-manager-execute
@@ -61,6 +67,10 @@ const CLAUDE_BIN = process.env.CLAUDE_CLI_PATH || 'claude';
 const FALLBACK_POLL_MS = parseInt(process.env.FALLBACK_POLL_MS || '600000', 10);
 const WS_PING_MS = parseInt(process.env.WS_PING_MS || '30000', 10);
 const CLAUDE_TIMEOUT_MS = parseInt(process.env.CLAUDE_TIMEOUT_MS || '600000', 10); // 10 min — allow deep research (read repo rules/glossary) before drafting, not a 30s rush
+// Most-capable model for these decision-support flows (CS drafts, manager triage,
+// Sentry auto-fix) — low volume, high stakes, worth the extra reasoning depth.
+// Empty string omits --model entirely (CLI's own default).
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL === '' ? '' : (process.env.CLAUDE_MODEL || 'claude-fable-5-1');
 const WORKSPACE_ALLOWLIST = (process.env.WORKSPACE_ALLOWLIST || '').split(',').map((s) => s.trim()).filter(Boolean);
 const SOURCE_ALLOWLIST = (process.env.SOURCE_ALLOWLIST || '').split(',').map((s) => s.trim()).filter(Boolean);
 const ENDPOINT = `${WEB_APP_URL}/api/copilot/webhooks/ccgram`;
@@ -153,6 +163,7 @@ function runClaude(cwd, prompt, { readOnly, parentSessionId }) {
     // ⚠️ NOT `--bare`: it disables OAuth/keychain auth (needs ANTHROPIC_API_KEY) →
     // `claude exited 1` on OAuth machines. Verified 2026-07-06.
     const args = ['--print', '--output-format', 'json', '--strict-mcp-config'];
+    if (CLAUDE_MODEL) args.push('--model', CLAUDE_MODEL);
     // Best-effort soft containment for untrusted (read-only) sessions: plan-mode +
     // a no-tools system prompt (verified to still emit the JSON). NOT a hard
     // boundary; the boundary is OS isolation (no reachable secrets on the box).
@@ -390,7 +401,7 @@ function connectDoorbell() {
   });
 }
 
-log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}]`);
+log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · model=${CLAUDE_MODEL || '(CLI default)'} · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}]`);
 maybeCatchup();                       // startup catchup (sets lastCatchupAt)
 setInterval(tick, FALLBACK_POLL_MS);  // safety net — Neon autosuspends between
 connectDoorbell();                    // primary push path
