@@ -35,12 +35,15 @@
  *                           MUST stay > Neon's 5-min autosuspend so Neon idles.
  *   WS_PING_MS              default 30000. Keep-alive ping to detect a dead socket.
  *   CLAUDE_TIMEOUT_MS       default 180000  (kill a stuck run)
- *   CLAUDE_MODEL            default "claude-fable-5-1". Passed as `--model <value>`.
+ *   CLAUDE_MODEL            default "claude-sonnet-5". Passed as `--model <value>`.
  *                           Set to "" (empty string) to omit the flag and fall back
- *                           to the CLI's own default model. NOT verified end-to-end
- *                           against this machine's installed `claude` CLI version —
- *                           confirm `claude --help` still shows `--model` before
- *                           relying on it; if the flag name changed, override here.
+ *                           to the CLI's own default model. Owner call (2026-09-01):
+ *                           Sonnet 5 is plenty for these grounded/bounded tasks
+ *                           (CS drafts, manager triage, Sentry auto-fix) — Fable
+ *                           5.1 was excessive and costlier for no measured benefit.
+ *                           NOT verified end-to-end against this machine's installed
+ *                           `claude` CLI version — confirm `claude --help` still
+ *                           shows `--model` before relying on it.
  *   WORKSPACE_ALLOWLIST     default "" (empty = any workspace with a matching dir)
  *   SOURCE_ALLOWLIST        default "" (empty = any source). For a SAFE first test set to
  *                           bakbukim-cs-draft,bakbukim-manager-triage,bakbukim-manager-execute
@@ -70,7 +73,7 @@ const CLAUDE_TIMEOUT_MS = parseInt(process.env.CLAUDE_TIMEOUT_MS || '600000', 10
 // Most-capable model for these decision-support flows (CS drafts, manager triage,
 // Sentry auto-fix) — low volume, high stakes, worth the extra reasoning depth.
 // Empty string omits --model entirely (CLI's own default).
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL === '' ? '' : (process.env.CLAUDE_MODEL || 'claude-fable-5-1');
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL === '' ? '' : (process.env.CLAUDE_MODEL || 'claude-sonnet-5');
 const WORKSPACE_ALLOWLIST = (process.env.WORKSPACE_ALLOWLIST || '').split(',').map((s) => s.trim()).filter(Boolean);
 const SOURCE_ALLOWLIST = (process.env.SOURCE_ALLOWLIST || '').split(',').map((s) => s.trim()).filter(Boolean);
 const ENDPOINT = `${WEB_APP_URL}/api/copilot/webhooks/ccgram`;
