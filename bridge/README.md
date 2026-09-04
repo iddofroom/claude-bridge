@@ -1,5 +1,10 @@
 # claude-bridge — bridge process
 
+⚠️ **This file documents `server.js`, which is LEGACY and confirmed unused in
+production (2026-09-04) — [`ccgram-poller.mjs`](ccgram-poller.mjs) replaced it
+(WebSocket doorbell, no open port/tunnel; see that file's own header comment).
+Verify which process is actually running before assuming this doc applies.**
+
 Tiny Node script that ferries prompts from the deployed web app to your local
 Claude Code installation.
 

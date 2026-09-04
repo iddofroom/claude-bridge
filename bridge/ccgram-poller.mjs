@@ -2,10 +2,12 @@
 /**
  * ccgram-poller — bridges iddofroom.co.il's `copilot_outbox` queue to the local
  * `claude` CLI. It holds a WebSocket "doorbell" to the hub: when a row is queued
- * the hub sends a `{type:"wake"}` frame and we drain the queue immediately, run
- * `claude --print` per prompt in the matching workspace folder, and post the
- * reply back. A rare fallback poll (default 10min) is only a safety net. No open
- * port, no tunnel, no cloudflared — the socket is an OUTBOUND connection.
+ * the hub sends a `{type:"wake"}` frame and we drain the queue immediately,
+ * best-effort `git pull --ff-only` the matching workspace folder (see
+ * syncWorkspace — never rewrites history or blocks on a diverged workspace),
+ * run `claude --print` per prompt there, and post the reply back. A rare
+ * fallback poll (default 10min) is only a safety net. No open port, no
+ * tunnel, no cloudflared — the socket is an OUTBOUND connection.
  *
  * Why push, not a 7s poll: the old poll ran a Neon query every 7s, 24/7, which
  * kept Neon's serverless compute from ever autosuspending — the single biggest
@@ -48,6 +50,9 @@
  *   SOURCE_ALLOWLIST        default "" (empty = any source). For a SAFE first test set to
  *                           bakbukim-cs-draft,bakbukim-manager-triage,bakbukim-manager-execute
  *                           to exclude Sentry auto-fixes while you validate.
+ *   BRIDGE_GIT_SYNC         default true. `git pull --ff-only` in the workspace before
+ *                           every prompt so Claude never runs against a stale checkout
+ *                           (see syncWorkspace). Set to "false" to disable.
  *
  * Run:  node ccgram-poller.mjs        (Node 18+; uses global fetch)
  */
@@ -76,6 +81,9 @@ const CLAUDE_TIMEOUT_MS = parseInt(process.env.CLAUDE_TIMEOUT_MS || '600000', 10
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL === '' ? '' : (process.env.CLAUDE_MODEL || 'claude-sonnet-5');
 const WORKSPACE_ALLOWLIST = (process.env.WORKSPACE_ALLOWLIST || '').split(',').map((s) => s.trim()).filter(Boolean);
 const SOURCE_ALLOWLIST = (process.env.SOURCE_ALLOWLIST || '').split(',').map((s) => s.trim()).filter(Boolean);
+// Best-effort `git pull --ff-only` in the workspace before every prompt — see
+// syncWorkspace below. Default on; set to "false" to disable.
+const GIT_SYNC = process.env.BRIDGE_GIT_SYNC !== 'false';
 const ENDPOINT = `${WEB_APP_URL}/api/copilot/webhooks/ccgram`;
 // WebSocket doorbell endpoint on the hub. http→ws / https→wss.
 const WS_URL = `${WEB_APP_URL.replace(/^http/, 'ws')}/api/copilot/bridge/socket`;
@@ -140,6 +148,40 @@ function resolveWorkspaceDir(workspace) {
     }
   }
   return null;
+}
+
+function isGitRepo(cwd) {
+  try {
+    fs.statSync(path.join(cwd, '.git'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Best-effort `git pull --ff-only` in the workspace before every prompt, so
+// Claude never analyzes/drafts against a checkout that's silently gone stale
+// — this machine has no other sync mechanism, so a workspace is otherwise
+// only ever as fresh as the last manual pull there. Fast-forward only: never
+// rewrites history or discards local state, so a diverged/uncommitted
+// workspace just logs a warning and runs against whatever's on disk rather
+// than blocking or corrupting anything. Non-git workspaces (no .git) are
+// skipped silently.
+function syncWorkspace(cwd) {
+  return new Promise((resolve) => {
+    if (!GIT_SYNC || !isGitRepo(cwd)) {
+      resolve({ ok: true, skipped: true });
+      return;
+    }
+    const child = spawn('git', ['pull', '--ff-only'], { cwd, shell: true });
+    let err = '';
+    child.stderr.on('data', (c) => (err += c.toString()));
+    child.on('error', (e) => resolve({ ok: false, error: e.message }));
+    child.on('close', (code) => {
+      if (code !== 0) resolve({ ok: false, error: err.trim().slice(0, 300) });
+      else resolve({ ok: true });
+    });
+  });
 }
 
 async function hub(method, { query = '', body } = {}) {
@@ -228,6 +270,10 @@ async function processItem(item) {
     return false;
   }
   if (!claimed) { log(`skip ${id}: already claimed by another consumer`); return false; }
+
+  const sync = await syncWorkspace(cwd);
+  if (!sync.ok) log(`git pull failed for ${workspace} (${cwd}) — continuing with existing checkout: ${sync.error}`);
+  else if (!sync.skipped) log(`synced ${workspace}`);
 
   // FAIL-CLOSED: only an explicit 'full' grants full capability. read_only / null /
   // unknown / a dropped field ⇒ read-only. The most dangerous default (full) must

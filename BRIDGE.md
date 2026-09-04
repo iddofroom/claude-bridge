@@ -1,5 +1,15 @@
 # Bridge setup
 
+⚠️ **This doc describes the legacy `server.js` (push-to-`/inject`) setup.**
+The machine currently in production runs **[`bridge/ccgram-poller.mjs`](bridge/ccgram-poller.mjs)**
+instead — a WebSocket-doorbell client with no open port/tunnel needed at all
+(see the file's own header comment for its protocol and env vars). `server.js`
+was confirmed killed/unused there 2026-09-04. Everything below (setup,
+`/inject`, port 7777, Cloudflare Tunnel) is `server.js`-specific and does NOT
+apply to the poller — kept here for reference only. Before touching bridge
+infra, check which process is ACTUALLY running on the target machine rather
+than assuming from this doc.
+
 The bridge is a ~150-line Node script in [`bridge/`](bridge/) that runs on
 your machine, receives prompts from the deployed web app, and pipes them into
 `claude --print`.
