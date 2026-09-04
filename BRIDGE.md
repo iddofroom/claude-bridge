@@ -90,3 +90,15 @@ set `AppDirectory` and env vars in the GUI, start the service.
 | Bridge never receives `/inject` | `BRIDGE_PUSH_URL` doesn't reach this machine. `curl https://<tunnel>/health` from elsewhere. |
 | Prompts queue but nothing fires | Bridge is down. Catchup runs on next start. |
 | Wrong workspace folder | `PROJECT_DIRS` order matters; first match wins. |
+| `git pull failed` in the log | Workspace has diverged/uncommitted local changes — the bridge always runs `git pull --ff-only` before invoking Claude (see [`bridge/README.md`](bridge/README.md)) and never force-syncs, so it just warns and runs against the existing checkout. Clean up the workspace by hand, or set `BRIDGE_GIT_SYNC=false` to stop trying. |
+
+## Keeping a workspace checkout fresh
+
+Each `PROJECT_DIRS/<workspace>` folder should be a normal git clone tracking
+whatever branch you want Claude to see (usually the repo's active dev
+branch). The bridge runs a best-effort `git pull --ff-only` in it before
+every prompt (`BRIDGE_GIT_SYNC`, default on) — without this, Claude would
+only ever see whatever was last pulled there by hand, and could re-suggest
+work that's already shipped (or already deliberately rejected) on your real
+dev machine. Set the workspace's upstream once (`git branch --set-upstream-to`)
+and the bridge keeps it current automatically from then on.

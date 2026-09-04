@@ -7,13 +7,20 @@
  *   1. Web app inserts a queued row in claude_outbox and POSTs to
  *      {tunnel-url}/inject (this server, exposed via Cloudflare Tunnel /
  *      ngrok / Tailscale).
- *   2. We spawn `claude --print --output-format json` in the matching
- *      workspace dir. If the request carries parent_session_id, we add
- *      `--resume <id>` so the conversation continues with memory.
- *   3. POST the response to {WEB_APP_URL}/api/webhooks/bridge — the JSON
+ *   2. Best-effort `git pull --ff-only` in the matching workspace dir (see
+ *      syncWorkspace) — otherwise this checkout is only ever as fresh as the
+ *      last manual pull, so Claude could draft/triage against stale code and
+ *      re-suggest work that's already shipped (or already rejected) on the
+ *      real dev machine. Skipped for non-git workspaces; a failed/diverged
+ *      pull just logs a warning and falls through to whatever's on disk —
+ *      never blocks the prompt. Disable with BRIDGE_GIT_SYNC=false.
+ *   3. We spawn `claude --print --output-format json` in that workspace dir.
+ *      If the request carries parent_session_id, we add `--resume <id>` so
+ *      the conversation continues with memory.
+ *   4. POST the response to {WEB_APP_URL}/api/webhooks/bridge — the JSON
  *      output gives us both the response text and the new session_id, which
  *      the web app stores so the next prompt on this thread can resume.
- *   4. PATCH the outbox row to 'sent' (or 'failed') so the UI knows.
+ *   5. PATCH the outbox row to 'sent' (or 'failed') so the UI knows.
  *
  * On startup we run a one-shot catchup against the queued outbox so any rows
  * inserted while the bridge was offline still get handled.
@@ -34,6 +41,7 @@ const PROJECT_DIRS = (process.env.PROJECT_DIRS || process.cwd())
   .filter(Boolean);
 const WEB_APP_URL = process.env.WEB_APP_URL;
 const CATCHUP_ON_STARTUP = process.env.BRIDGE_CATCHUP !== 'false';
+const GIT_SYNC = process.env.BRIDGE_GIT_SYNC !== 'false';
 
 if (!PUSH_SECRET) {
   console.error('BRIDGE_SECRET not set — refusing to start.');
@@ -59,6 +67,40 @@ function findProjectDir(workspace) {
   fs.mkdirSync(target, { recursive: true });
   console.log(`[bridge] created workspace dir: ${target}`);
   return target;
+}
+
+function isGitRepo(cwd) {
+  try {
+    fs.statSync(path.join(cwd, '.git'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Best-effort `git pull --ff-only` in the workspace before every prompt, so
+// Claude never analyzes/drafts against a checkout that's silently gone stale
+// (this machine has no other sync mechanism — the workspace dir is otherwise
+// only as fresh as the last time someone manually pulled it). Fast-forward
+// only: never rewrites history or discards local state, so a workspace with
+// diverged/uncommitted changes just logs a warning and runs against whatever
+// is on disk rather than blocking or corrupting anything. Non-git workspaces
+// (no .git) are skipped silently — not every workspace is a repo.
+function syncWorkspace(cwd) {
+  return new Promise((resolve) => {
+    if (!GIT_SYNC || !isGitRepo(cwd)) {
+      resolve({ ok: true, skipped: true });
+      return;
+    }
+    const child = spawn('git', ['pull', '--ff-only'], { cwd, shell: true });
+    let err = '';
+    child.stderr.on('data', (c) => (err += c.toString()));
+    child.on('error', (e) => resolve({ ok: false, error: e.message }));
+    child.on('close', (code) => {
+      if (code !== 0) resolve({ ok: false, error: err.trim().slice(0, 300) });
+      else resolve({ ok: true });
+    });
+  });
 }
 
 function runClaude(cwd, prompt, parentSessionId, permissionMode) {
@@ -141,6 +183,12 @@ async function processItem({
   const modeNote = permission_mode === 'read_only' ? ' [read-only]' : '';
   console.log(`[bridge] inject → ${workspace}${resumeNote}${modeNote} (${prompt.slice(0, 60).replace(/\s+/g, ' ')}…)`);
   const cwd = findProjectDir(workspace);
+  const sync = await syncWorkspace(cwd);
+  if (!sync.ok) {
+    console.warn(`[bridge] git pull failed in ${workspace} (${cwd}) — continuing with existing checkout: ${sync.error}`);
+  } else if (!sync.skipped) {
+    console.log(`[bridge] synced → ${workspace}`);
+  }
   try {
     const { text, sessionId } = await runClaude(cwd, prompt, parent_session_id, permission_mode);
     await postInbox(workspace, text, sessionId, conversation_id);

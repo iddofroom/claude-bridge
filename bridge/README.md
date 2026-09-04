@@ -22,11 +22,15 @@ exposes itself directly to the network. Use a tunnel.
 ## What it does
 
 1. `POST /inject` — receives a queued prompt from the web app.
-2. Runs `claude --print` in the matching workspace folder (resolved by
-   walking `PROJECT_DIRS`).
-3. POSTs Claude's reply back to `${WEB_APP_URL}/api/webhooks/bridge`.
-4. PATCHes the outbox row to `sent` (or `failed`).
-5. On startup: runs a one-shot catchup pass against any queued rows so
+2. `git pull --ff-only` in the matching workspace folder (resolved by
+   walking `PROJECT_DIRS`) if it's a git repo — best-effort, so the checkout
+   Claude sees never silently goes stale. Skipped for non-git workspaces; a
+   failed/diverged pull just logs a warning and continues with whatever's on
+   disk. Disable with `BRIDGE_GIT_SYNC=false`.
+3. Runs `claude --print` in that workspace folder.
+4. POSTs Claude's reply back to `${WEB_APP_URL}/api/webhooks/bridge`.
+5. PATCHes the outbox row to `sent` (or `failed`).
+6. On startup: runs a one-shot catchup pass against any queued rows so
    nothing is lost if the bridge was offline.
 
 Endpoints exposed by this server:
@@ -38,4 +42,5 @@ Endpoints exposed by this server:
 
 See `.env.example`. Required: `BRIDGE_SECRET`, `WEB_APP_URL`. Optional:
 `BRIDGE_PORT` (default 7777), `CLAUDE_CLI_PATH` (default `claude`),
-`PROJECT_DIRS` (default `process.cwd()`), `BRIDGE_CATCHUP` (default `true`).
+`PROJECT_DIRS` (default `process.cwd()`), `BRIDGE_CATCHUP` (default `true`),
+`BRIDGE_GIT_SYNC` (default `true` — `git pull --ff-only` before every prompt).
