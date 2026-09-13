@@ -8,6 +8,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@playwright/mcp": "0.0.80",
     "dotenv": "^17.0.0"
   }
 }

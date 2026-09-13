@@ -54,12 +54,25 @@
  *                           every prompt so Claude never runs against a stale checkout
  *                           (see syncWorkspace). Set to "false" to disable.
  *
+ * Browser mode (bridge/browser/README.md): prompts to BROWSER_WORKSPACE drive a real
+ * Chrome on this machine through Playwright MCP. Every other workspace is unchanged.
+ *   BROWSER_WORKSPACE       default "browser"
+ *   BROWSER_SOURCES         default "iddofroom-admin,scheduled-task" (owner-authored only).
+ *                           Any other source, or a read_only row, is failed — never run.
+ *   BROWSER_HOME            default C:\claude-browser — profile\ (logins), secrets.env, out\
+ *   BROWSER_CDP_PORT        default 9222 (Chrome binds it to 127.0.0.1)
+ *   CHROME_PATH             default: Chrome's standard install folders
+ *   BROWSER_CHROME_ARGS     extra Chrome flags, space-separated (e.g. --headless=new)
+ *
  * Run:  node ccgram-poller.mjs        (Node 18+; uses global fetch)
+ *       node ccgram-poller.mjs --browser-check ["prompt"] [--resume <session-id>]
+ *                                     one browser-mode run with no hub (setup, debugging)
  */
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const SECRET = process.env.CCGRAM_WEBHOOK_SECRET;
 const WEB_APP_URL = (process.env.WEB_APP_URL || 'https://iddofroom.co.il').replace(/\/+$/, '');
@@ -84,6 +97,15 @@ const SOURCE_ALLOWLIST = (process.env.SOURCE_ALLOWLIST || '').split(',').map((s)
 // Best-effort `git pull --ff-only` in the workspace before every prompt — see
 // syncWorkspace below. Default on; set to "false" to disable.
 const GIT_SYNC = process.env.BRIDGE_GIT_SYNC !== 'false';
+// Browser mode — see the header and bridge/browser/README.md.
+const BRIDGE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const BROWSER_WORKSPACE = (process.env.BROWSER_WORKSPACE || 'browser').toLowerCase();
+const BROWSER_SOURCES = (process.env.BROWSER_SOURCES || 'iddofroom-admin,scheduled-task').split(',').map((s) => s.trim()).filter(Boolean);
+const BROWSER_HOME = process.env.BROWSER_HOME || 'C:\\claude-browser';
+const BROWSER_CDP_PORT = parseInt(process.env.BROWSER_CDP_PORT || '9222', 10);
+const BROWSER_CHROME_ARGS = (process.env.BROWSER_CHROME_ARGS || '').split(/\s+/).filter(Boolean);
+const BROWSER_RULES_FILE = path.join(BRIDGE_DIR, 'browser', 'rules.md');
+const PLAYWRIGHT_MCP_CLI = path.join(BRIDGE_DIR, 'node_modules', '@playwright', 'mcp', 'cli.js');
 const ENDPOINT = `${WEB_APP_URL}/api/copilot/webhooks/ccgram`;
 // WebSocket doorbell endpoint on the hub. http→ws / https→wss.
 const WS_URL = `${WEB_APP_URL.replace(/^http/, 'ws')}/api/copilot/bridge/socket`;
@@ -102,6 +124,10 @@ const WORKSPACE_RE = /^[a-zA-Z0-9._-]+$/;
 // ⚠️ TESTED (2026-07-06): CLI tool-flags do NOT sandbox `claude --print` —
 // --allowedTools, --disallowedTools, and even --settings permissions.deny are
 // ALL ignored in print mode (it auto-approves; that's why Sentry can write).
+// 2026-09-13, CLI 2.1.270: the auto-approval comes from allow rules in the user's
+// settings ("Bash(*)", "PowerShell(*)"), which apply even under --permission-mode
+// dontAsk. `--tools ""` (no built-in tools) and `--disallowedTools <mcp tool>` DID
+// remove tools in print mode — browser mode relies on both (see runClaude).
 // The ONLY hard control is OS-LEVEL ISOLATION of THIS process: run under a
 // least-privilege account/container whose filesystem view has NO secret files
 // (.env*, credentials), NO network egress except the hub, and NO MCP servers.
@@ -119,6 +145,7 @@ const NO_TOOLS_INSTRUCTION = [
 const TMP = process.env.TEMP || process.env.TMP || process.cwd();
 const NO_TOOLS_FILE = path.join(TMP, 'ccgram-notools-prompt.txt');
 try { fs.writeFileSync(NO_TOOLS_FILE, NO_TOOLS_INSTRUCTION, 'utf8'); } catch (e) { console.error('could not write no-tools prompt file:', e.message); }
+const BROWSER_MCP_FILE = path.join(TMP, 'ccgram-browser-mcp.json');
 // MCP is disabled via `--strict-mcp-config` ALONE (no --mcp-config). That flag
 // means "use ONLY servers passed via --mcp-config"; with none passed, ZERO MCP
 // servers load. ⚠️ Do NOT pass `--mcp-config <file:{"mcpServers":{}}>`: some CLI
@@ -126,13 +153,37 @@ try { fs.writeFileSync(NO_TOOLS_FILE, NO_TOOLS_INSTRUCTION, 'utf8'); } catch (e)
 // mcpServers: Does not adhere to MCP server configuration schema") → the run dies
 // with `claude exited 1`. Verified 2026-07-06: `--strict-mcp-config` alone runs
 // clean AND loads no MCP (returned valid JSON, num_turns=1).
+// The one exception is browser mode: --strict-mcp-config plus a --mcp-config that
+// names only the Playwright server (BROWSER_MCP_FILE, written by prepareBrowser).
+
+const log = (...a) => console.log(`[ccgram-poller ${new Date().toISOString()}]`, ...a);
+
+// `--browser-check` runs one browser-mode prompt without the hub and exits — used
+// by browser/setup.ps1, and handy when the browser misbehaves on this machine.
+if (process.argv.includes('--browser-check')) {
+  const argv = process.argv.slice(2);
+  const resumeAt = argv.indexOf('--resume');
+  const parentSessionId = resumeAt >= 0 ? argv[resumeAt + 1] : null;
+  const prompt = argv.find((a, i) => !a.startsWith('--') && (resumeAt < 0 || i !== resumeAt + 1))
+    || 'Setup check: take a snapshot of the current tab and reply with its URL and title only. Do not navigate or click.';
+  try {
+    const cwd = resolveWorkspaceDir(BROWSER_WORKSPACE);
+    if (!cwd) throw new Error(`no '${BROWSER_WORKSPACE}' folder under PROJECT_DIRS (${PROJECT_DIRS.join(', ')})`);
+    await prepareBrowser();
+    const { text, sessionId, denials } = await runClaude(cwd, prompt, { browser: true, parentSessionId });
+    console.log(text);
+    console.log(`\nsession: ${sessionId || '(none)'}${denials.length ? `\npermission denied: ${denials.join(', ')}` : ''}`);
+    process.exit(0);
+  } catch (e) {
+    console.error(`browser check failed: ${e.message}`);
+    process.exit(1);
+  }
+}
 
 if (!SECRET) {
   console.error('CCGRAM_WEBHOOK_SECRET not set — refusing to start.');
   process.exit(1);
 }
-
-const log = (...a) => console.log(`[ccgram-poller ${new Date().toISOString()}]`, ...a);
 
 function resolveWorkspaceDir(workspace) {
   // Reject path-traversal / shell metachars before touching the filesystem.
@@ -184,6 +235,58 @@ function syncWorkspace(cwd) {
   });
 }
 
+function findChrome() {
+  const candidates = [
+    process.env.CHROME_PATH,
+    process.env.ProgramFiles && path.join(process.env.ProgramFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    process.env['ProgramFiles(x86)'] && path.join(process.env['ProgramFiles(x86)'], 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+  ];
+  return candidates.find((p) => p && fs.existsSync(p)) || null;
+}
+
+async function browserUp() {
+  try {
+    const res = await fetch(`http://127.0.0.1:${BROWSER_CDP_PORT}/json/version`, { signal: AbortSignal.timeout(2000) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Browser mode keeps ONE Chrome alive across runs: started detached (never a child
+// of a claude run), with its own profile and a localhost debugging port. Each run's
+// Playwright MCP attaches to it over CDP, so logins AND the open page survive
+// between messages — an SMS code sent in the next message goes into the same field
+// that asked for it. Chrome 136+ ignores the debugging port on the default profile,
+// so the separate --user-data-dir is required, not just tidy.
+async function prepareBrowser() {
+  if (!fs.existsSync(PLAYWRIGHT_MCP_CLI)) throw new Error(`browser mode: Playwright MCP is not installed — run npm install in ${BRIDGE_DIR}`);
+  const secrets = path.join(BROWSER_HOME, 'secrets.env');
+  const mcpArgs = [PLAYWRIGHT_MCP_CLI, '--cdp-endpoint', `http://127.0.0.1:${BROWSER_CDP_PORT}`, '--output-dir', path.join(BROWSER_HOME, 'out')];
+  // Claude types a secret's NAME; Playwright MCP fills in the value and redacts it
+  // from every snapshot and log line it returns.
+  if (fs.existsSync(secrets)) mcpArgs.push('--secrets', secrets);
+  fs.writeFileSync(BROWSER_MCP_FILE, JSON.stringify({ mcpServers: { browser: { command: process.execPath, args: mcpArgs } } }), 'utf8');
+
+  if (await browserUp()) return;
+  const chrome = findChrome();
+  if (!chrome) throw new Error('browser mode: chrome.exe not found — set CHROME_PATH');
+  const profile = path.join(BROWSER_HOME, 'profile');
+  fs.mkdirSync(profile, { recursive: true });
+  spawn(chrome, [`--user-data-dir=${profile}`, `--remote-debugging-port=${BROWSER_CDP_PORT}`, '--no-first-run', '--no-default-browser-check', ...BROWSER_CHROME_ARGS], { detached: true, stdio: 'ignore' }).unref();
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    if (await browserUp()) {
+      log(`browser: started Chrome (profile ${profile}, port ${BROWSER_CDP_PORT})`);
+      return;
+    }
+  }
+  // Usually a window of this same profile was opened WITHOUT the port — Chrome then
+  // only adds a window to that process. Closing it lets the next prompt restart it.
+  throw new Error(`browser mode: Chrome did not open port ${BROWSER_CDP_PORT} within 15s — close any Chrome window using ${profile} and retry`);
+}
+
 async function hub(method, { query = '', body } = {}) {
   const res = await fetch(`${ENDPOINT}${query}`, {
     method,
@@ -199,20 +302,33 @@ async function hub(method, { query = '', body } = {}) {
   return json;
 }
 
-function runClaude(cwd, prompt, { readOnly, parentSessionId }) {
+function runClaude(cwd, prompt, { readOnly, browser, parentSessionId }) {
   return new Promise((resolve, reject) => {
-    // Disable MCP for ALL sessions — no Gmail/Drive/etc., a key out-of-band exfil
-    // channel the output scanner can't see. Neither cs-draft/triage nor execute
-    // needs MCP. `--strict-mcp-config` alone = load ZERO MCP servers (pass NO
-    // --mcp-config; an empty-object config file is rejected by some CLI builds).
+    // Disable MCP for every session but browser mode — no Gmail/Drive/etc., a key
+    // out-of-band exfil channel the output scanner can't see. Neither cs-draft/triage
+    // nor execute needs MCP. `--strict-mcp-config` alone = load ZERO MCP servers (pass
+    // NO --mcp-config; an empty-object config file is rejected by some CLI builds).
     // ⚠️ NOT `--bare`: it disables OAuth/keychain auth (needs ANTHROPIC_API_KEY) →
     // `claude exited 1` on OAuth machines. Verified 2026-07-06.
     const args = ['--print', '--output-format', 'json', '--strict-mcp-config'];
     if (CLAUDE_MODEL) args.push('--model', CLAUDE_MODEL);
-    // Best-effort soft containment for untrusted (read-only) sessions: plan-mode +
-    // a no-tools system prompt (verified to still emit the JSON). NOT a hard
-    // boundary; the boundary is OS isolation (no reachable secrets on the box).
-    if (readOnly) args.push('--permission-mode', 'plan', '--append-system-prompt-file', NO_TOOLS_FILE);
+    if (browser) {
+      // Only the Playwright server loads, and `--tools ""` removes EVERY built-in tool
+      // (Bash, PowerShell, Read, Monitor, Agent…), so the browser tools are all Claude
+      // has. ⚠️ dontAsk alone is NOT a sandbox: allow rules in the machine's user
+      // settings ("Bash(*)", "PowerShell(*)") still apply in dontAsk — verified
+      // 2026-09-13 on CLI 2.1.270, a browser run curled the CDP port. dontAsk +
+      // --allowedTools only let the browser tools run without a prompt nobody can
+      // answer. '""' reaches claude as an empty argument through shell:true.
+      // browser_run_code_unsafe runs arbitrary JS inside the Playwright MCP process (its
+      // own description says "RCE-equivalent"), which would undo all of this — removed.
+      args.push('--mcp-config', BROWSER_MCP_FILE, '--tools', '""', '--disallowedTools', 'mcp__browser__browser_run_code_unsafe', '--permission-mode', 'dontAsk', '--allowedTools', 'mcp__browser', '--append-system-prompt-file', BROWSER_RULES_FILE);
+    } else if (readOnly) {
+      // Best-effort soft containment for untrusted (read-only) sessions: plan-mode +
+      // a no-tools system prompt (verified to still emit the JSON). NOT a hard
+      // boundary; the boundary is OS isolation (no reachable secrets on the box).
+      args.push('--permission-mode', 'plan', '--append-system-prompt-file', NO_TOOLS_FILE);
+    }
     // Only resume on a strict UUID — never let an arbitrary value reach the argv.
     if (parentSessionId && UUID_RE.test(parentSessionId)) args.push('--resume', parentSessionId);
     const child = spawn(CLAUDE_BIN, args, { cwd, shell: true });
@@ -234,9 +350,10 @@ function runClaude(cwd, prompt, { readOnly, parentSessionId }) {
         resolve({
           text: typeof p.result === 'string' ? p.result : trimmed,
           sessionId: typeof p.session_id === 'string' ? p.session_id : null,
+          denials: Array.isArray(p.permission_denials) ? p.permission_denials.map((d) => d?.tool_name).filter(Boolean) : [],
         });
       } catch {
-        resolve({ text: trimmed, sessionId: null });
+        resolve({ text: trimmed, sessionId: null, denials: [] });
       }
     });
     child.stdin.write(prompt);
@@ -279,9 +396,20 @@ async function processItem(item) {
   // unknown / a dropped field ⇒ read-only. The most dangerous default (full) must
   // never be the fallback for the most dangerous (untrusted) input.
   const readOnly = permissionMode !== 'full';
-  log(`run ${id} ws=${workspace} src=${source || '?'} ${readOnly ? '[read-only]' : '[full]'} (${String(prompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
+  // Browser mode drives a logged-in Chrome, so it is never a fallback either: only
+  // owner-authored sources get it, and a row explicitly marked read_only (untrusted
+  // input) never does. The hub also refuses this workspace on its external API.
+  const browser = String(workspace).toLowerCase() === BROWSER_WORKSPACE;
+  if (browser && (permissionMode === 'read_only' || !BROWSER_SOURCES.includes(source))) {
+    log(`FAIL ${id}: browser workspace refused for source '${source || '?'}'`);
+    try { await hub('PATCH', { body: { id, status: 'failed', error: `the ${BROWSER_WORKSPACE} workspace is not available to source '${source || '?'}'` } }); } catch {}
+    return true;
+  }
+  log(`run ${id} ws=${workspace} src=${source || '?'} ${browser ? '[browser]' : readOnly ? '[read-only]' : '[full]'} (${String(prompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
   try {
-    const { text, sessionId } = await runClaude(cwd, prompt, { readOnly, parentSessionId });
+    if (browser) await prepareBrowser();
+    const { text, sessionId, denials } = await runClaude(cwd, prompt, { readOnly, browser, parentSessionId });
+    if (denials.length) log(`${id}: permission denied → ${denials.join(', ')}`);
     await hub('POST', { body: { workspace, response: text, claude_session_id: sessionId, conversation_id: conversationId, outbox_id: id } });
     await hub('PATCH', { body: { id, status: 'sent' } });
     log(`done ${id}${sessionId ? ` session=${sessionId.slice(0, 8)}` : ''}`);
