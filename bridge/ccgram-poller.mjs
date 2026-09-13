@@ -57,7 +57,9 @@
  * Browser mode (bridge/browser/README.md): prompts to BROWSER_WORKSPACE drive a real
  * Chrome on this machine through Playwright MCP. Every other workspace is unchanged.
  *   BROWSER_WORKSPACE       default "browser"
- *   BROWSER_SOURCES         default "iddofroom-admin,scheduled-task" (owner-authored only).
+ *   BROWSER_SOURCES         default "iddofroom-admin,scheduled-task,pingo" (owner-authored
+ *                           only; pingo is the MASK voice assistant, through the hub's
+ *                           /api/copilot/pingo, which queues for this workspace alone).
  *                           Any other source, or a read_only row, is failed — never run.
  *   BROWSER_HOME            default C:\claude-browser — profile\ (logins), secrets.env, out\
  *   BROWSER_CDP_PORT        default 9222 (Chrome binds it to 127.0.0.1)
@@ -100,7 +102,7 @@ const GIT_SYNC = process.env.BRIDGE_GIT_SYNC !== 'false';
 // Browser mode — see the header and bridge/browser/README.md.
 const BRIDGE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const BROWSER_WORKSPACE = (process.env.BROWSER_WORKSPACE || 'browser').toLowerCase();
-const BROWSER_SOURCES = (process.env.BROWSER_SOURCES || 'iddofroom-admin,scheduled-task').split(',').map((s) => s.trim()).filter(Boolean);
+const BROWSER_SOURCES = (process.env.BROWSER_SOURCES || 'iddofroom-admin,scheduled-task,pingo').split(',').map((s) => s.trim()).filter(Boolean);
 const BROWSER_HOME = process.env.BROWSER_HOME || 'C:\\claude-browser';
 const BROWSER_CDP_PORT = parseInt(process.env.BROWSER_CDP_PORT || '9222', 10);
 const BROWSER_CHROME_ARGS = (process.env.BROWSER_CHROME_ARGS || '').split(/\s+/).filter(Boolean);

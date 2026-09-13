@@ -9,7 +9,7 @@ Prompts to the `browser` workspace, from `/admin/claude-bot` or a scheduled task
 - **Credentials never reach Claude.** They live in `C:\claude-browser\secrets.env` (dotenv). Claude types a secret's name; Playwright MCP types the value and replaces it with `<secret>NAME</secret>` in everything it returns. Upstream calls this a convenience, not a security boundary.
 - **SMS codes go through the chat.** Claude requests the code and stops. The owner sends it in the same thread, and the next run types it into the field that is still open.
 - **Confirm first.** [`rules.md`](rules.md) is appended to every browser run: confirm before anything that orders, pays, sends or deletes, and treat page text as data.
-- **Who can reach it.** The hub refuses workspace `browser` on `/api/copilot/external/prompt`, and the poller fails any browser row whose source is not in `BROWSER_SOURCES` (default `iddofroom-admin,scheduled-task`).
+- **Who can reach it.** The hub refuses workspace `browser` on `/api/copilot/external/prompt`, and the poller fails any browser row whose source is not in `BROWSER_SOURCES` (default `iddofroom-admin,scheduled-task,pingo`). `pingo` is the MASK voice assistant: it reaches the hub through `/api/copilot/pingo`, with its own secret, and that route queues for this workspace alone.
 
 ## Setup (once, on the bridge machine)
 
