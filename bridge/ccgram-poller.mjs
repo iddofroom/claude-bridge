@@ -108,6 +108,33 @@ const BROWSER_CDP_PORT = parseInt(process.env.BROWSER_CDP_PORT || '9222', 10);
 const BROWSER_CHROME_ARGS = (process.env.BROWSER_CHROME_ARGS || '').split(/\s+/).filter(Boolean);
 const BROWSER_RULES_FILE = path.join(BRIDGE_DIR, 'browser', 'rules.md');
 const PLAYWRIGHT_MCP_CLI = path.join(BRIDGE_DIR, 'node_modules', '@playwright', 'mcp', 'cli.js');
+// Jobs lane — the owner's voice assistant sends Claude to research something or to build a new
+// app or site through the hub's /api/copilot/pingo/jobs (bridge/jobs/rules.md). Those rows run
+// with FULL permissions in their own lane beside the one-at-a-time queue, so a 90-minute build
+// never holds up a browser request, and each job workspace has its own time limit.
+//   JOBS_WORKSPACES   default "pingo-research:30,pingo-build:90" (workspace:minutes). Each needs a
+//                     folder under PROJECT_DIRS; every job runs in a new subfolder of it.
+//   JOBS_SOURCES      default "pingo-jobs". A job workspace fails any other source and any row
+//                     that is not 'full'; a job source is failed in every other workspace.
+//   JOBS_PARALLEL     default 1 (jobs running at once; the others wait queued)
+//   JOBS_MODEL        default "" (= CLAUDE_MODEL)
+// A job that runs out of time is stopped, and its RESULT.md is posted as the answer, so the
+// owner still gets what it found.
+const JOBS_WORKSPACES = new Map(
+  (process.env.JOBS_WORKSPACES || 'pingo-research:30,pingo-build:90')
+    .split(',').map((s) => s.trim()).filter(Boolean)
+    .map((s) => {
+      const [ws, minutes] = s.split(':');
+      return [ws.trim().toLowerCase(), Math.max(1, parseInt(minutes, 10) || 30)];
+    }),
+);
+const JOBS_SOURCES = (process.env.JOBS_SOURCES || 'pingo-jobs').split(',').map((s) => s.trim()).filter(Boolean);
+const JOBS_PARALLEL = Math.max(1, parseInt(process.env.JOBS_PARALLEL || '1', 10) || 1);
+const JOBS_MODEL = process.env.JOBS_MODEL || '';
+const JOBS_RULES_FILE = path.join(BRIDGE_DIR, 'jobs', 'rules.md');
+const JOB_RESULT_FILE = 'RESULT.md';
+const JOB_RESULT_MAX = 400000; // characters of RESULT.md posted when a job runs out of time
+const runningJobs = new Set(); // outbox ids of the jobs running now
 const ENDPOINT = `${WEB_APP_URL}/api/copilot/webhooks/ccgram`;
 // WebSocket doorbell endpoint on the hub. http→ws / https→wss.
 const WS_URL = `${WEB_APP_URL.replace(/^http/, 'ws')}/api/copilot/bridge/socket`;
@@ -363,6 +390,126 @@ function runClaude(cwd, prompt, { readOnly, browser, parentSessionId }) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Jobs lane (see JOBS_WORKSPACES above and bridge/jobs/rules.md).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// With shell:true the child is a shell, and on Windows killing the shell leaves claude running.
+// taskkill /T ends the whole tree; elsewhere SIGKILL the child.
+function killTree(child) {
+  if (process.platform === 'win32' && child.pid) {
+    try { spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { shell: true }); return; } catch {}
+  }
+  try { child.kill('SIGKILL'); } catch {}
+}
+
+// One job run: FULL permissions (bypassPermissions — nobody could answer a permission prompt),
+// the built-in tools, still no MCP servers, jobs/rules.md appended, and a hard time limit. A run
+// that runs out of time resolves with timedOut, never rejects, so its RESULT.md is still posted.
+function runJob(cwd, prompt, minutes) {
+  return new Promise((resolve, reject) => {
+    const args = ['--print', '--output-format', 'json', '--strict-mcp-config', '--permission-mode', 'bypassPermissions', '--append-system-prompt-file', JOBS_RULES_FILE];
+    const model = JOBS_MODEL || CLAUDE_MODEL;
+    if (model) args.push('--model', model);
+    const child = spawn(CLAUDE_BIN, args, { cwd, shell: true });
+    let out = '';
+    let err = '';
+    let settled = false;
+    const settle = (fn, value) => { if (!settled) { settled = true; clearTimeout(killer); clearTimeout(backstop); fn(value); } };
+    const killer = setTimeout(() => killTree(child), minutes * 60000);
+    // If the kill never closes the pipes, free the slot anyway a minute later.
+    const backstop = setTimeout(() => settle(resolve, { timedOut: true, text: '', sessionId: null }), minutes * 60000 + 60000);
+    child.stdout.on('data', (c) => (out += c));
+    child.stderr.on('data', (c) => (err += c));
+    child.on('error', (e) => settle(reject, e));
+    child.on('close', (code) => {
+      if (Date.now() - startedAt >= minutes * 60000) return settle(resolve, { timedOut: true, text: '', sessionId: null });
+      if (code !== 0) return settle(reject, new Error(`claude exited ${code}: ${err.trim().slice(0, 500)}`));
+      const trimmed = out.trim();
+      try {
+        const p = JSON.parse(trimmed);
+        settle(resolve, { timedOut: false, text: typeof p.result === 'string' ? p.result : trimmed, sessionId: typeof p.session_id === 'string' ? p.session_id : null });
+      } catch {
+        settle(resolve, { timedOut: false, text: trimmed, sessionId: null });
+      }
+    });
+    const startedAt = Date.now();
+    child.stdin.write(`${prompt}\n\n[Time limit: ${minutes} minutes. Past it this run is stopped, and RESULT.md is what the owner gets.]`);
+    child.stdin.end();
+  });
+}
+
+// A job's answer arrives after up to 90 minutes of work: don't lose it to one failed request.
+async function postJobAnswer(body) {
+  for (let attempt = 1; ; attempt++) {
+    try { return await hub('POST', { body }); } catch (e) {
+      if (attempt >= 5) throw e;
+      log(`job answer post failed (${e.message}), retry ${attempt}/4 in 30s`);
+      await new Promise((r) => setTimeout(r, 30000));
+    }
+  }
+}
+
+// Like processItem, returns true iff we claimed the row. The job then runs in the background, so
+// the queue moves on at once. A job workspace already running JOBS_PARALLEL jobs leaves the row
+// queued; the next one starts when a running job ends.
+async function startJob(item, cwd) {
+  const { id, workspace, prompt, permission_mode: permissionMode, conversation_id: conversationId, source } = item;
+  const minutes = JOBS_WORKSPACES.get(String(workspace).toLowerCase());
+  if (minutes !== undefined && runningJobs.size >= JOBS_PARALLEL) return false;
+  let claimed;
+  try {
+    const res = await hub('PATCH', { body: { id, status: 'processing' } });
+    claimed = res?.claimed !== false;
+  } catch (e) {
+    log(`skip ${id}: claim failed (${e.message}) — left queued`);
+    return false;
+  }
+  if (!claimed) { log(`skip ${id}: already claimed by another consumer`); return false; }
+  // FAIL-CLOSED both ways: a job workspace runs only an explicit 'full' row from a job source,
+  // and a job source reaches no other workspace.
+  if (minutes === undefined || permissionMode !== 'full' || !JOBS_SOURCES.includes(source)) {
+    const why = minutes === undefined
+      ? `source '${source}' may only use the job workspaces`
+      : `the ${workspace} workspace runs only 'full' rows from ${JOBS_SOURCES.join(', ')}`;
+    log(`FAIL ${id}: ${why}`);
+    try { await hub('PATCH', { body: { id, status: 'failed', error: why } }); } catch {}
+    return true;
+  }
+  const dir = path.join(cwd, `${new Date().toISOString().slice(0, 10)}-${String(id).slice(0, 8)}`);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    log(`FAIL ${id}: no job folder (${e.message})`);
+    try { await hub('PATCH', { body: { id, status: 'failed', error: `no job folder: ${e.message}`.slice(0, 500) } }); } catch {}
+    return true;
+  }
+  runningJobs.add(id);
+  log(`job ${id} ws=${workspace} src=${source} [full, ${minutes} min] in ${dir} (${String(prompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
+  (async () => {
+    try {
+      const { timedOut, text, sessionId } = await runJob(dir, prompt, minutes);
+      let response = text;
+      if (timedOut) {
+        let partial = '';
+        try { partial = fs.readFileSync(path.join(dir, JOB_RESULT_FILE), 'utf8').slice(0, JOB_RESULT_MAX); } catch {}
+        response = JSON.stringify({ timed_out: true, minutes, report: partial });
+        log(`job ${id}: out of time after ${minutes} min, posting ${partial.length} chars of ${JOB_RESULT_FILE}`);
+      }
+      await postJobAnswer({ workspace, response, claude_session_id: sessionId, conversation_id: conversationId, outbox_id: id });
+      await hub('PATCH', { body: { id, status: 'sent' } });
+      log(`job done ${id}`);
+    } catch (e) {
+      log(`job FAIL ${id}: ${e.message}`);
+      try { await hub('PATCH', { body: { id, status: 'failed', error: String(e.message).slice(0, 500) } }); } catch {}
+    } finally {
+      runningJobs.delete(id);
+      setTimeout(tick, 500); // a job that waited for the slot starts now
+    }
+  })();
+  return true;
+}
+
 // Returns true iff WE claimed the row (moved it out of 'queued') — i.e. progress
 // was made. false means skipped (allowlist / no dir / claimed by another bridge /
 // claim failed), so the drain loop won't treat it as progress.
@@ -372,6 +519,10 @@ async function processItem(item) {
   if (SOURCE_ALLOWLIST.length && !SOURCE_ALLOWLIST.includes(source)) return false;
   const cwd = resolveWorkspaceDir(workspace);
   if (!cwd) { log(`skip ${id}: no dir for workspace '${workspace}' under PROJECT_DIRS`); return false; }
+  // A job workspace, or a job source anywhere (failed there): the jobs lane, in the background.
+  if (JOBS_WORKSPACES.has(String(workspace).toLowerCase()) || JOBS_SOURCES.includes(source)) {
+    return startJob(item, cwd);
+  }
 
   // Atomic claim: the doorbell broadcasts each wake to EVERY connected bridge, so
   // a second instance can race for this row. The hub flips queued→processing only
@@ -580,7 +731,7 @@ function connectDoorbell() {
   });
 }
 
-log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · model=${CLAUDE_MODEL || '(CLI default)'} · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}]`);
+log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · model=${CLAUDE_MODEL || '(CLI default)'} · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}] · jobs=[${[...JOBS_WORKSPACES].map(([w, m]) => `${w}:${m}m`).join(',')}]×${JOBS_PARALLEL} from [${JOBS_SOURCES.join(',')}]`);
 maybeCatchup();                       // startup catchup (sets lastCatchupAt)
 setInterval(tick, FALLBACK_POLL_MS);  // safety net — Neon autosuspends between
 connectDoorbell();                    // primary push path
