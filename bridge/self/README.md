@@ -8,13 +8,19 @@ The lane is the jobs lane with its own workspace, `pingo-self` (120 minutes), it
 
 1. Pull claude-bridge (`dev`) and restart the poller. Its startup line must now end with `jobs=[pingo-research:30m,pingo-build:90m,pingo-self:120m]×1 from [pingo-jobs]`.
 2. Create the workspace folder `C:\websites\pingo-self` (under `PROJECT_DIRS`). Each job still runs in its own `<date>-<id>` subfolder of it, which is where `RESULT.md` goes.
-3. Clone the assistant's own (private) repo **inside that folder**, as `mask`:
+3. Clone the assistant's own (private) repo **inside that folder**, as `mask`, **and check out
+   `dev`**:
    ```
-   gh repo clone <owner>/<assistant repo> C:\websites\pingo-self\mask
+   gh repo clone <owner>/<assistant repo> C:\websites\pingo-self\mask -- --branch dev
+   cd C:\websites\pingo-self\mask && git rev-parse --abbrev-ref HEAD    # must print: dev
    ```
-   The repo's name is in the setup prompt the owner hands this machine — this repo is public, so it
-   is not written here. `gh auth status` must show a login that can push to it: the runs push a
-   branch and `dev`.
+   ⚠ The default branch is `main`, and on that assistant `main` is the first phase of the project:
+   hundreds of commits old, with none of the packages it is made of (`features/`, `brain/`,
+   `audio/`, `memory/`). A clone left on `main` looks fine and then fails every gate, and its venv
+   is built from a `pyproject.toml` that is missing half the dependencies (2026-09-17). The repo's
+   name is in the setup prompt the owner hands this machine — this repo is public, so it is not
+   written here. `gh auth status` must show a login that can push to it: the runs push a branch
+   and `dev`.
 4. Give that clone a venv with the gates in it — the gates are what decides whether a change ever reaches the device:
    ```
    cd C:\websites\pingo-self\mask
