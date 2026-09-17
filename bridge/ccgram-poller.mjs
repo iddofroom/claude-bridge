@@ -112,8 +112,11 @@ const PLAYWRIGHT_MCP_CLI = path.join(BRIDGE_DIR, 'node_modules', '@playwright', 
 // app or site through the hub's /api/copilot/pingo/jobs (bridge/jobs/rules.md). Those rows run
 // with FULL permissions in their own lane beside the one-at-a-time queue, so a 90-minute build
 // never holds up a browser request, and each job workspace has its own time limit.
-//   JOBS_WORKSPACES   default "pingo-research:30,pingo-build:90" (workspace:minutes). Each needs a
-//                     folder under PROJECT_DIRS; every job runs in a new subfolder of it.
+//   JOBS_WORKSPACES   default "pingo-research:30,pingo-build:90,pingo-self:120" (workspace:minutes).
+//                     Each needs a folder under PROJECT_DIRS; every job runs in a new subfolder.
+//                     pingo-self is the assistant changing its OWN code (bridge/self/rules.md): it
+//                     works in the mask clone beside the job folder, pushes a branch, and the
+//                     device decides whether to install it.
 //   JOBS_SOURCES      default "pingo-jobs". A job workspace fails any other source and any row
 //                     that is not 'full'; a job source is failed in every other workspace.
 //   JOBS_PARALLEL     default 1 (jobs running at once; the others wait queued)
@@ -121,7 +124,7 @@ const PLAYWRIGHT_MCP_CLI = path.join(BRIDGE_DIR, 'node_modules', '@playwright', 
 // A job that runs out of time is stopped, and its RESULT.md is posted as the answer, so the
 // owner still gets what it found.
 const JOBS_WORKSPACES = new Map(
-  (process.env.JOBS_WORKSPACES || 'pingo-research:30,pingo-build:90')
+  (process.env.JOBS_WORKSPACES || 'pingo-research:30,pingo-build:90,pingo-self:120')
     .split(',').map((s) => s.trim()).filter(Boolean)
     .map((s) => {
       const [ws, minutes] = s.split(':');
@@ -132,6 +135,12 @@ const JOBS_SOURCES = (process.env.JOBS_SOURCES || 'pingo-jobs').split(',').map((
 const JOBS_PARALLEL = Math.max(1, parseInt(process.env.JOBS_PARALLEL || '1', 10) || 1);
 const JOBS_MODEL = process.env.JOBS_MODEL || '';
 const JOBS_RULES_FILE = path.join(BRIDGE_DIR, 'jobs', 'rules.md');
+// Changing the assistant's own code is a different job with different limits, so it gets its own
+// rules: the repo it may touch, the gates it must pass, and what the device refuses to install.
+const SELF_WORKSPACE = (process.env.SELF_WORKSPACE || 'pingo-self').toLowerCase();
+const SELF_RULES_FILE = path.join(BRIDGE_DIR, 'self', 'rules.md');
+const rulesFor = (workspace) =>
+  String(workspace).toLowerCase() === SELF_WORKSPACE ? SELF_RULES_FILE : JOBS_RULES_FILE;
 const JOB_RESULT_FILE = 'RESULT.md';
 const JOB_RESULT_MAX = 400000; // characters of RESULT.md posted when a job runs out of time
 const runningJobs = new Set(); // outbox ids of the jobs running now
@@ -406,9 +415,9 @@ function killTree(child) {
 // One job run: FULL permissions (bypassPermissions — nobody could answer a permission prompt),
 // the built-in tools, still no MCP servers, jobs/rules.md appended, and a hard time limit. A run
 // that runs out of time resolves with timedOut, never rejects, so its RESULT.md is still posted.
-function runJob(cwd, prompt, minutes) {
+function runJob(cwd, prompt, minutes, rulesFile = JOBS_RULES_FILE) {
   return new Promise((resolve, reject) => {
-    const args = ['--print', '--output-format', 'json', '--strict-mcp-config', '--permission-mode', 'bypassPermissions', '--append-system-prompt-file', JOBS_RULES_FILE];
+    const args = ['--print', '--output-format', 'json', '--strict-mcp-config', '--permission-mode', 'bypassPermissions', '--append-system-prompt-file', rulesFile];
     const model = JOBS_MODEL || CLAUDE_MODEL;
     if (model) args.push('--model', model);
     const child = spawn(CLAUDE_BIN, args, { cwd, shell: true });
@@ -488,7 +497,7 @@ async function startJob(item, cwd) {
   log(`job ${id} ws=${workspace} src=${source} [full, ${minutes} min] in ${dir} (${String(prompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
   (async () => {
     try {
-      const { timedOut, text, sessionId } = await runJob(dir, prompt, minutes);
+      const { timedOut, text, sessionId } = await runJob(dir, prompt, minutes, rulesFor(workspace));
       let response = text;
       if (timedOut) {
         let partial = '';
