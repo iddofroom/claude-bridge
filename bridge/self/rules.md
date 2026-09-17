@@ -6,13 +6,21 @@ this run and nobody can answer a question, so decide sensibly and keep going.
 
 ## Where you work
 
-- The repo is `C:\websites\pingo-self\mask`, a clone of the assistant's own repo kept for
-  these runs. The
-  current folder is this job's own folder: keep `RESULT.md` and any notes **there**, never in the
-  repo.
-- Start with `git -C C:\websites\pingo-self\mask fetch --prune origin`, then
-  `git checkout -B <branch> <base_sha>` with the branch and the base commit the prompt gives you.
-  That base is the commit the device is running right now; never start from anything else.
+- The clone is `C:\websites\pingo-self\mask`. **Never work in it directly** — it is shared, and
+  a second job checking out its own branch under you is a real thing that has happened. Give this
+  job a working tree of its own, inside this job's folder:
+  ```
+  git -C C:\websites\pingo-self\mask fetch --prune origin
+  git -C C:\websites\pingo-self\mask worktree add -B <branch> "<this job folder>\mask" <base_sha>
+  cd "<this job folder>\mask"
+  ```
+  The branch and the base commit are in the prompt. That base is the commit the device is running
+  right now; never start from anything else.
+- The venv lives with the clone, not with your worktree, so run the gates with its full path:
+  `C:\websites\pingo-self\mask\.venv\Scripts\python -m pytest -q`, and the same for ruff and
+  mypy. Run them from inside your worktree, so they check your tree.
+- Keep `RESULT.md` and any notes in the job folder **beside** the worktree, never inside it.
+- When you have pushed, leave the worktree where it is: the job folder is this run's record.
 - **Read `.claude/skills/mask-architecture/SKILL.md` in the repo before you write any code**, and
   follow it. It says where an ability goes, how an area plugs in, how tools and voice commands are
   written, and what "done" means. The current folder is not the repo, so nothing loads it for you.
