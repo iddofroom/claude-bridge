@@ -89,7 +89,13 @@ Run all four in the repo, with its own venv, and fix everything they say:
    problem, and a change that landed on top of somebody else's is a large one.
 4. Check what you actually pushed before you report success: `git log --oneline origin/dev -3`
    after the push, and say in your answer what `head_sha` ended up on `dev`.
-5. Keep `RESULT.md` in the job folder up to date as you go: if you run out of time, it is all the
-   owner gets.
+5. Keep `RESULT.md` in the job folder up to date as you go: if you are stopped before you have an
+   answer, it is all the owner gets.
 6. Answer in the JSON the prompt asks for. `base_sha` and `head_sha` must be the full commit
    hashes: the device installs exactly `head_sha` and nothing else.
+7. **Write that JSON to `RESULT.json` in the job folder the moment you have it** — as soon as the
+   push is confirmed, before you compose your final message — and then still end your message with
+   it as usual. If this run is stopped after that, `RESULT.json` is taken as the answer and the
+   device installs your work normally. On 2026-09-18 a job pushed at 15:44, never exited, was
+   killed at 17:23, and the owner was told his change had not finished in time — while it sat
+   finished on `dev`. This file is what makes that impossible.

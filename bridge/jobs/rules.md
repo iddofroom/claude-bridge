@@ -11,7 +11,8 @@ The owner's voice assistant sent you on a job: research, or building something n
 
 The prompt ends with the time limit. When it runs out the run is stopped, and only what you wrote down reaches the owner. So:
 
-- Keep `RESULT.md` in the current folder up to date as you go: what you found or built so far, with its links. If the run is stopped, `RESULT.md` is what the owner gets.
+- Keep `RESULT.md` in the current folder up to date as you go: what you found or built so far, with its links. If the run is stopped before you have an answer, `RESULT.md` is what the owner gets.
+- **Write the final JSON to `RESULT.json` in the current folder the moment you have it**, before you compose your last message, and then still end your message with it as usual. A run stopped after that point is answered from `RESULT.json`, so finished work is never reported as unfinished.
 - Leave a few minutes at the end for the final answer.
 
 ## Safety

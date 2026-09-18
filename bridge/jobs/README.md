@@ -14,7 +14,14 @@ The owner's voice assistant (פינגו, MASK `features/claude_jobs`) sends Clau
 
 - פינגו's prompt, with the time limit appended.
 - `--permission-mode bypassPermissions`, every built-in tool, no MCP servers (`--strict-mcp-config`), and `jobs/rules.md` appended to the system prompt.
-- A hard time limit per workspace (`JOBS_WORKSPACES`; defaults: research 30 minutes, build 90, self 120). On timeout the whole process tree is killed, and the job folder's `RESULT.md` is posted as the answer: `{"timed_out": true, "minutes": N, "report": "..."}`.
+- A time limit per workspace (`JOBS_WORKSPACES`; defaults: research 30 minutes, build 90, self 120) — now only the **absolute backstop**, see below.
+
+## What stops a run, and what it still answers
+
+The owner, 2026-09-18: "צריך להוריד את המגבלה של הזמן - ושהיא תסתיים." A run used to be killed by the clock alone. That day a job pushed its work at 15:44, never exited, and was killed on the 120-minute cap at 17:23 — and פינגו told him his change "did not finish in time" about a change that was already merged into `dev`. Two things changed:
+
+- **The clock is on doing nothing, not on the work.** `JOBS_IDLE_MINUTES` (default 25) stops a run that has written nothing anywhere in its job folder for that long — hung, not slow. A working run touches disk constantly (the files it edits, git's index, pytest's and mypy's caches), so a slow job is left alone however long it takes. `JOBS_WORKSPACES`' minutes remain as a backstop so a wedged lane cannot stay wedged for ever; raise them freely now that they no longer cut work short.
+- **A stopped run still answers.** Both rules files tell a job to write its final JSON to `RESULT.json` the moment it has one — right after the push, before it composes its last message. If that file is there and parses, it *is* the answer, killed or not, and the device installs the work normally. Only when it is absent does the poller fall back to `{"timed_out": true, "minutes": N, "stopped": "...", "report": <RESULT.md>}`.
 
 ## One lane per workspace
 

@@ -125,9 +125,12 @@ const PLAYWRIGHT_MCP_CLI = path.join(BRIDGE_DIR, 'node_modules', '@playwright', 
 //                     which pingo-self depends on: every one of its jobs is told to start from the
 //                     commit the device is running, so two at once would be written against a
 //                     version the first of them is about to replace.
+//   JOBS_IDLE_MINUTES default 25. A run is stopped when it has written nothing anywhere in its job
+//                     folder for this long — hung, not slow. JOBS_WORKSPACES' minutes are only the
+//                     absolute backstop now (the owner, 2026-09-18).
 //   JOBS_MODEL        default "" (= CLAUDE_MODEL)
-// A job that runs out of time is stopped, and its RESULT.md is posted as the answer, so the
-// owner still gets what it found.
+// A job that is stopped still answers: if it had already written RESULT.json, that IS the answer;
+// otherwise its RESULT.md is posted, so the owner still gets what it found.
 const JOBS_WORKSPACES = new Map(
   (process.env.JOBS_WORKSPACES || 'pingo-research:30,pingo-build:90,pingo-self:120')
     .split(',').map((s) => s.trim()).filter(Boolean)
@@ -147,7 +150,17 @@ const SELF_RULES_FILE = path.join(BRIDGE_DIR, 'self', 'rules.md');
 const rulesFor = (workspace) =>
   String(workspace).toLowerCase() === SELF_WORKSPACE ? SELF_RULES_FILE : JOBS_RULES_FILE;
 const JOB_RESULT_FILE = 'RESULT.md';
+// The finished answer, written by the job the moment it has one — before it composes its final
+// message. On 2026-09-18 a job pushed its work at 15:44, never exited, and was killed on the
+// 120-minute cap at 17:23: the owner was told "it did not finish in time" about work that was
+// already on dev. If this file is here and parses, it IS the answer, killed or not.
+const JOB_ANSWER_FILE = 'RESULT.json';
 const JOB_RESULT_MAX = 400000; // characters of RESULT.md posted when a job runs out of time
+// The owner, 2026-09-18: "צריך להוריד את המגבלה של הזמן - ושהיא תסתיים". So the clock that stops a
+// run is no longer a clock on the work but on doing nothing: a run that has not written a byte
+// anywhere in its job folder for this long is hung, and only then is it killed. JOBS_WORKSPACES'
+// minutes stay as an absolute backstop so a wedged lane cannot be wedged for ever.
+const JOBS_IDLE_MIN = Math.max(2, parseInt(process.env.JOBS_IDLE_MINUTES || '25', 10) || 25);
 const runningJobs = new Map(); // outbox id → the workspace it is running in
 const runningIn = (ws) => [...runningJobs.values()].filter((w) => w === ws).length;
 const ENDPOINT = `${WEB_APP_URL}/api/copilot/webhooks/ccgram`;
@@ -418,9 +431,35 @@ function killTree(child) {
   try { child.kill('SIGKILL'); } catch {}
 }
 
+// The newest thing written anywhere in the job folder, as a timestamp. A run that is working
+// touches disk constantly — the files it edits, git's index, pytest's and mypy's caches — so this
+// is what tells "still going" from "hung" without asking the run anything. The walk is bounded so
+// a big worktree cannot make the check itself expensive, and a directory it cannot read is skipped
+// rather than treated as silence.
+function newestWrite(dir, budget = 20000) {
+  let newest = 0;
+  const stack = [dir];
+  while (stack.length && budget > 0) {
+    const here = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(here, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      if (--budget < 0) break;
+      const full = path.join(here, entry.name);
+      try {
+        const stat = fs.statSync(full);
+        if (stat.mtimeMs > newest) newest = stat.mtimeMs;
+        if (entry.isDirectory()) stack.push(full);
+      } catch { /* vanished mid-walk: that is activity, not silence */ }
+    }
+  }
+  return newest;
+}
+
 // One job run: FULL permissions (bypassPermissions — nobody could answer a permission prompt),
-// the built-in tools, still no MCP servers, jobs/rules.md appended, and a hard time limit. A run
-// that runs out of time resolves with timedOut, never rejects, so its RESULT.md is still posted.
+// the built-in tools, still no MCP servers, jobs/rules.md appended. It is stopped when it has gone
+// JOBS_IDLE_MIN without writing anything, or when it passes `minutes` outright (the backstop). A
+// run that is stopped resolves with timedOut, never rejects, so its answer is still posted.
 function runJob(cwd, prompt, minutes, rulesFile = JOBS_RULES_FILE) {
   return new Promise((resolve, reject) => {
     const args = ['--print', '--output-format', 'json', '--strict-mcp-config', '--permission-mode', 'bypassPermissions', '--append-system-prompt-file', rulesFile];
@@ -430,15 +469,26 @@ function runJob(cwd, prompt, minutes, rulesFile = JOBS_RULES_FILE) {
     let out = '';
     let err = '';
     let settled = false;
-    const settle = (fn, value) => { if (!settled) { settled = true; clearTimeout(killer); clearTimeout(backstop); fn(value); } };
-    const killer = setTimeout(() => killTree(child), minutes * 60000);
+    let stopped = '';
+    const settle = (fn, value) => { if (!settled) { settled = true; clearInterval(watch); clearTimeout(backstop); fn(value); } };
+    // Checked once a minute: hung (nothing written for JOBS_IDLE_MIN), or past the absolute cap.
+    let lastWrite = Date.now();
+    const watch = setInterval(() => {
+      const written = newestWrite(cwd);
+      if (written > lastWrite) lastWrite = written;
+      const idleMin = (Date.now() - lastWrite) / 60000;
+      const ranMin = (Date.now() - startedAt) / 60000;
+      if (idleMin >= JOBS_IDLE_MIN) stopped = `hung: nothing written for ${Math.round(idleMin)} min`;
+      else if (ranMin >= minutes) stopped = `past the ${minutes} min backstop`;
+      if (stopped) { clearInterval(watch); log(`job stopping — ${stopped}`); killTree(child); }
+    }, 60000);
     // If the kill never closes the pipes, free the slot anyway a minute later.
-    const backstop = setTimeout(() => settle(resolve, { timedOut: true, text: '', sessionId: null }), minutes * 60000 + 60000);
+    const backstop = setTimeout(() => settle(resolve, { timedOut: true, text: '', sessionId: null }), minutes * 60000 + 120000);
     child.stdout.on('data', (c) => (out += c));
     child.stderr.on('data', (c) => (err += c));
     child.on('error', (e) => settle(reject, e));
     child.on('close', (code) => {
-      if (Date.now() - startedAt >= minutes * 60000) return settle(resolve, { timedOut: true, text: '', sessionId: null });
+      if (stopped) return settle(resolve, { timedOut: true, stopped, text: '', sessionId: null });
       if (code !== 0) return settle(reject, new Error(`claude exited ${code}: ${err.trim().slice(0, 500)}`));
       const trimmed = out.trim();
       try {
@@ -505,13 +555,24 @@ async function startJob(item, cwd) {
   log(`job ${id} ws=${workspace} src=${source} [full, ${minutes} min] in ${dir} (${String(prompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
   (async () => {
     try {
-      const { timedOut, text, sessionId } = await runJob(dir, prompt, minutes, rulesFor(workspace));
+      const { timedOut, stopped, text, sessionId } = await runJob(dir, prompt, minutes, rulesFor(workspace));
       let response = text;
       if (timedOut) {
-        let partial = '';
-        try { partial = fs.readFileSync(path.join(dir, JOB_RESULT_FILE), 'utf8').slice(0, JOB_RESULT_MAX); } catch {}
-        response = JSON.stringify({ timed_out: true, minutes, report: partial });
-        log(`job ${id}: out of time after ${minutes} min, posting ${partial.length} chars of ${JOB_RESULT_FILE}`);
+        // A run that was stopped may still have finished its work: the answer file is written the
+        // moment the job has an answer, long before it composes its last message. Prefer it over
+        // reporting a failure about work that is already pushed.
+        let answer = '';
+        try { answer = fs.readFileSync(path.join(dir, JOB_ANSWER_FILE), 'utf8').trim(); } catch {}
+        try { if (answer) JSON.parse(answer); } catch { answer = ''; }
+        if (answer) {
+          response = answer;
+          log(`job ${id}: stopped (${stopped}) but ${JOB_ANSWER_FILE} was already written — posting it as the answer`);
+        } else {
+          let partial = '';
+          try { partial = fs.readFileSync(path.join(dir, JOB_RESULT_FILE), 'utf8').slice(0, JOB_RESULT_MAX); } catch {}
+          response = JSON.stringify({ timed_out: true, minutes, stopped, report: partial });
+          log(`job ${id}: stopped (${stopped}), posting ${partial.length} chars of ${JOB_RESULT_FILE}`);
+        }
       }
       await postJobAnswer({ workspace, response, claude_session_id: sessionId, conversation_id: conversationId, outbox_id: id });
       await hub('PATCH', { body: { id, status: 'sent' } });
