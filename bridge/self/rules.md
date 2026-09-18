@@ -72,10 +72,24 @@ Run all four in the repo, with its own venv, and fix everything they say:
 
 1. One commit. The message is one plain sentence about the behaviour, in the repo's style
    ("Pingo says לבריאות when it hears a sneeze"), and nothing else.
-2. Push your branch, then merge it into `dev` (fast-forward when you can) and push `dev`, so the
-   work survives the owner's next manual deploy. If `dev` has moved and the merge is not a
-   fast-forward, merge `dev` into your branch, run the gates again, and push both.
-3. Keep `RESULT.md` in the job folder up to date as you go: if you run out of time, it is all the
+2. Push your branch, then merge it into `dev` and push `dev`, so the work survives the owner's
+   next manual deploy. **Fetch first, every time**, and treat what you fetched as the truth:
+   ```
+   git fetch origin
+   git merge-base --is-ancestor origin/dev HEAD    # must succeed before you push dev
+   ```
+   Somebody else may have pushed while you were working — a person at a keyboard, or another run
+   like you. If `origin/dev` is not already an ancestor of your work, merge `origin/dev` into your
+   branch, **run all four gates again**, and only then push. Never push a `dev` that does not
+   contain everything `origin/dev` had a moment ago: that is how somebody else's morning quietly
+   disappears.
+3. **A rejected push is never resolved by forcing it.** No `--force`, no `--force-with-lease`, no
+   deleting and recreating a branch. A rejection means the answer above: fetch, merge, gate, push.
+   If that still fails, stop and say so in your report — a change that did not land is a small
+   problem, and a change that landed on top of somebody else's is a large one.
+4. Check what you actually pushed before you report success: `git log --oneline origin/dev -3`
+   after the push, and say in your answer what `head_sha` ended up on `dev`.
+5. Keep `RESULT.md` in the job folder up to date as you go: if you run out of time, it is all the
    owner gets.
-4. Answer in the JSON the prompt asks for. `base_sha` and `head_sha` must be the full commit
+6. Answer in the JSON the prompt asks for. `base_sha` and `head_sha` must be the full commit
    hashes: the device installs exactly `head_sha` and nothing else.
