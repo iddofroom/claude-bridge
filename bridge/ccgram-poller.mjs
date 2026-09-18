@@ -119,7 +119,12 @@ const PLAYWRIGHT_MCP_CLI = path.join(BRIDGE_DIR, 'node_modules', '@playwright', 
 //                     device decides whether to install it.
 //   JOBS_SOURCES      default "pingo-jobs". A job workspace fails any other source and any row
 //                     that is not 'full'; a job source is failed in every other workspace.
-//   JOBS_PARALLEL     default 1 (jobs running at once; the others wait queued)
+//   JOBS_PARALLEL     default 1, counted PER WORKSPACE (the owner, 2026-09-18): a 90-minute build
+//                     no longer holds up a change to the assistant's own code, and the other way
+//                     round. Within one workspace the rows still run strictly one after another,
+//                     which pingo-self depends on: every one of its jobs is told to start from the
+//                     commit the device is running, so two at once would be written against a
+//                     version the first of them is about to replace.
 //   JOBS_MODEL        default "" (= CLAUDE_MODEL)
 // A job that runs out of time is stopped, and its RESULT.md is posted as the answer, so the
 // owner still gets what it found.
@@ -143,7 +148,8 @@ const rulesFor = (workspace) =>
   String(workspace).toLowerCase() === SELF_WORKSPACE ? SELF_RULES_FILE : JOBS_RULES_FILE;
 const JOB_RESULT_FILE = 'RESULT.md';
 const JOB_RESULT_MAX = 400000; // characters of RESULT.md posted when a job runs out of time
-const runningJobs = new Set(); // outbox ids of the jobs running now
+const runningJobs = new Map(); // outbox id → the workspace it is running in
+const runningIn = (ws) => [...runningJobs.values()].filter((w) => w === ws).length;
 const ENDPOINT = `${WEB_APP_URL}/api/copilot/webhooks/ccgram`;
 // WebSocket doorbell endpoint on the hub. http→ws / https→wss.
 const WS_URL = `${WEB_APP_URL.replace(/^http/, 'ws')}/api/copilot/bridge/socket`;
@@ -460,12 +466,14 @@ async function postJobAnswer(body) {
 }
 
 // Like processItem, returns true iff we claimed the row. The job then runs in the background, so
-// the queue moves on at once. A job workspace already running JOBS_PARALLEL jobs leaves the row
-// queued; the next one starts when a running job ends.
+// the queue moves on at once. A workspace already running JOBS_PARALLEL of its own jobs leaves the
+// row queued; the next one starts when one of THAT workspace's jobs ends, so the lanes wait only
+// on themselves.
 async function startJob(item, cwd) {
   const { id, workspace, prompt, permission_mode: permissionMode, conversation_id: conversationId, source } = item;
-  const minutes = JOBS_WORKSPACES.get(String(workspace).toLowerCase());
-  if (minutes !== undefined && runningJobs.size >= JOBS_PARALLEL) return false;
+  const lane = String(workspace).toLowerCase();
+  const minutes = JOBS_WORKSPACES.get(lane);
+  if (minutes !== undefined && runningIn(lane) >= JOBS_PARALLEL) return false;
   let claimed;
   try {
     const res = await hub('PATCH', { body: { id, status: 'processing' } });
@@ -493,7 +501,7 @@ async function startJob(item, cwd) {
     try { await hub('PATCH', { body: { id, status: 'failed', error: `no job folder: ${e.message}`.slice(0, 500) } }); } catch {}
     return true;
   }
-  runningJobs.add(id);
+  runningJobs.set(id, lane);
   log(`job ${id} ws=${workspace} src=${source} [full, ${minutes} min] in ${dir} (${String(prompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
   (async () => {
     try {
@@ -740,7 +748,7 @@ function connectDoorbell() {
   });
 }
 
-log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · model=${CLAUDE_MODEL || '(CLI default)'} · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}] · jobs=[${[...JOBS_WORKSPACES].map(([w, m]) => `${w}:${m}m`).join(',')}]×${JOBS_PARALLEL} from [${JOBS_SOURCES.join(',')}]`);
+log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · model=${CLAUDE_MODEL || '(CLI default)'} · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}] · jobs=[${[...JOBS_WORKSPACES].map(([w, m]) => `${w}:${m}m`).join(',')}]×${JOBS_PARALLEL} each from [${JOBS_SOURCES.join(',')}]`);
 maybeCatchup();                       // startup catchup (sets lastCatchupAt)
 setInterval(tick, FALLBACK_POLL_MS);  // safety net — Neon autosuspends between
 connectDoorbell();                    // primary push path

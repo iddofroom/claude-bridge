@@ -4,7 +4,7 @@ The owner's voice assistant (פינגו, MASK `features/claude_jobs`) sends Clau
 
 ## On the bridge machine, once
 
-1. Pull claude-bridge (`dev`) and restart the poller: the lane is poller code. Its startup line now ends with `jobs=[pingo-research:30m,pingo-build:90m]×1 from [pingo-jobs]`.
+1. Pull claude-bridge (`dev`) and restart the poller: the lane is poller code. Its startup line now ends with `jobs=[pingo-research:30m,pingo-build:90m,pingo-self:120m]×1 each from [pingo-jobs]`.
 2. Create the two workspace folders under `PROJECT_DIRS`: `C:\websites\pingo-research` and `C:\websites\pingo-build`. They need no git. Every job gets its own subfolder, named `<date>-<first 8 characters of the outbox id>`.
 3. For builds, `gh auth status` and `netlify status` must both show a login: a build creates a private GitHub repo and a Netlify site.
 4. Check that a print run may use full permissions: `claude -p --permission-mode bypassPermissions "reply with the word ok"`. If a setting disables bypass mode, every job fails with that message.
@@ -14,7 +14,13 @@ The owner's voice assistant (פינגו, MASK `features/claude_jobs`) sends Clau
 
 - פינגו's prompt, with the time limit appended.
 - `--permission-mode bypassPermissions`, every built-in tool, no MCP servers (`--strict-mcp-config`), and `jobs/rules.md` appended to the system prompt.
-- A hard time limit per workspace (`JOBS_WORKSPACES`; defaults: research 30 minutes, build 90). On timeout the whole process tree is killed, and the job folder's `RESULT.md` is posted as the answer: `{"timed_out": true, "minutes": N, "report": "..."}`.
+- A hard time limit per workspace (`JOBS_WORKSPACES`; defaults: research 30 minutes, build 90, self 120). On timeout the whole process tree is killed, and the job folder's `RESULT.md` is posted as the answer: `{"timed_out": true, "minutes": N, "report": "..."}`.
+
+## One lane per workspace
+
+`JOBS_PARALLEL` (default 1) is counted **per workspace**, not across all of them (the owner, 2026-09-18). A 90-minute build and a 120-minute change to the assistant's own code therefore no longer wait on each other; before this, one queue served all three and a build could hold up a dictated change for over half an hour.
+
+Within one workspace the rows still run strictly one after another, and `pingo-self` depends on that: each of its jobs is told to start from the commit the device is running, so two at once would both be written against a version the first of them is about to replace. Raise `JOBS_PARALLEL` only if every lane can take it.
 
 ## Safety
 
