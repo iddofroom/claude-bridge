@@ -53,6 +53,11 @@
  *   BRIDGE_GIT_SYNC         default true. `git pull --ff-only` in the workspace before
  *                           every prompt so Claude never runs against a stale checkout
  *                           (see syncWorkspace). Set to "false" to disable.
+ *   REPO_JOBS / REPO_JOBS_SOURCES  repo lanes: full-permission jobs that change an existing
+ *                           project, each in a fresh worktree of it (bridge/repo-jobs/README.md).
+ *                           Defaults give bakbukim one lane, "bakbukim-tasks", fed only by
+ *                           source "bakbukim-owner-task". A WORKSPACE_ALLOWLIST / SOURCE_ALLOWLIST,
+ *                           if set, must name them too.
  *
  * Browser mode (bridge/browser/README.md): prompts to BROWSER_WORKSPACE drive a real
  * Chrome on this machine through Playwright MCP. Every other workspace is unchanged.
@@ -156,6 +161,48 @@ const JOB_RESULT_FILE = 'RESULT.md';
 // already on dev. If this file is here and parses, it IS the answer, killed or not.
 const JOB_ANSWER_FILE = 'RESULT.json';
 const JOB_RESULT_MAX = 400000; // characters of RESULT.md posted when a job runs out of time
+// Repo lanes — a job that changes an EXISTING project (first user: bakbukim, the owner's phone
+// screen "משימות לקלוד", 2026-10-03). A פינגו build starts from an empty folder; this kind of job
+// must run inside the project, so the project's own CLAUDE.md, skills and node_modules apply. Each
+// job gets a fresh git worktree of the repo, cut from origin/<base>, at
+// <repo>\.claude\worktrees\studio-<date>-<id>, on branch task/studio-<date>-<id>
+// (bridge/repo-jobs/README.md). Same lane rules as the jobs lane (full rows only, one at a time per
+// lane, the idle stop), with a source list PER LANE: a פינגו job never reaches a repo lane, and an
+// owner task never reaches a פינגו lane or the one-at-a-time queue.
+//   REPO_JOBS          default "bakbukim-tasks:bakbukim:dev:240" — lane:repo folder:base branch:minutes
+//   REPO_JOBS_SOURCES  default "bakbukim-tasks=bakbukim-owner-task" — lane=source[|source…], comma-separated
+// RESULT.md / RESULT.json go to a folder OUTSIDE the worktree (named at the end of the prompt), so a
+// job that stages with `git add -A` can never commit them into the project.
+const LANE_NAME_RE = /^[a-zA-Z0-9._-]+$/; // = WORKSPACE_RE below, which is not declared yet here
+const REPO_JOBS = new Map(
+  (process.env.REPO_JOBS ?? 'bakbukim-tasks:bakbukim:dev:240')
+    .split(',').map((s) => s.trim()).filter(Boolean)
+    .map((s) => {
+      const [lane, repo, base, minutes] = s.split(':').map((p) => (p || '').trim());
+      return [lane.toLowerCase(), { repo, base: base || 'dev', minutes: Math.max(1, parseInt(minutes, 10) || 120) }];
+    })
+    .filter(([lane, conf]) => LANE_NAME_RE.test(lane) && LANE_NAME_RE.test(conf.repo) && /^[a-zA-Z0-9._/-]+$/.test(conf.base)),
+);
+const REPO_JOB_SOURCES = new Map(
+  (process.env.REPO_JOBS_SOURCES ?? 'bakbukim-tasks=bakbukim-owner-task')
+    .split(',').map((s) => s.trim()).filter(Boolean)
+    .map((s) => {
+      const [lane, sources = ''] = s.split('=');
+      return [lane.trim().toLowerCase(), sources.split('|').map((x) => x.trim()).filter(Boolean)];
+    }),
+);
+const REPO_RULES_FILE = path.join(BRIDGE_DIR, 'repo-jobs', 'rules.md');
+const REPO_RESULTS_DIR = path.join(process.env.TEMP || process.env.TMP || process.cwd(), 'bridge-repo-jobs');
+// Which lane a workspace is, if any: { minutes, sources, repo?, base? }.
+function jobLane(workspace) {
+  const lane = String(workspace).toLowerCase();
+  const repo = REPO_JOBS.get(lane);
+  if (repo) return { ...repo, sources: REPO_JOB_SOURCES.get(lane) || [] };
+  const minutes = JOBS_WORKSPACES.get(lane);
+  return minutes === undefined ? null : { minutes, sources: JOBS_SOURCES };
+}
+const REPO_SOURCES_ALL = [...REPO_JOB_SOURCES.values()].flat();
+const isJobSource = (source) => JOBS_SOURCES.includes(source) || REPO_SOURCES_ALL.includes(source);
 // The owner, 2026-09-18: "צריך להוריד את המגבלה של הזמן - ושהיא תסתיים". So the clock that stops a
 // run is no longer a clock on the work but on doing nothing: a run that has not written a byte
 // anywhere in its job folder for this long is hung, and only then is it killed. JOBS_WORKSPACES'
@@ -460,7 +507,7 @@ function newestWrite(dir, budget = 20000) {
 // the built-in tools, still no MCP servers, jobs/rules.md appended. It is stopped when it has gone
 // JOBS_IDLE_MIN without writing anything, or when it passes `minutes` outright (the backstop). A
 // run that is stopped resolves with timedOut, never rejects, so its answer is still posted.
-function runJob(cwd, prompt, minutes, rulesFile = JOBS_RULES_FILE) {
+function runJob(cwd, prompt, minutes, rulesFile = JOBS_RULES_FILE, resultDir = '') {
   return new Promise((resolve, reject) => {
     const args = ['--print', '--output-format', 'json', '--strict-mcp-config', '--permission-mode', 'bypassPermissions', '--append-system-prompt-file', rulesFile];
     const model = JOBS_MODEL || CLAUDE_MODEL;
@@ -499,7 +546,8 @@ function runJob(cwd, prompt, minutes, rulesFile = JOBS_RULES_FILE) {
       }
     });
     const startedAt = Date.now();
-    child.stdin.write(`${prompt}\n\n[Time limit: ${minutes} minutes. Past it this run is stopped, and RESULT.md is what the owner gets.]`);
+    const where = resultDir ? ` Write RESULT.md and RESULT.json in ${resultDir} (not in the project).` : '';
+    child.stdin.write(`${prompt}\n\n[Time limit: ${minutes} minutes. Past it this run is stopped, and RESULT.md is what the owner gets.${where}]`);
     child.stdin.end();
   });
 }
@@ -519,11 +567,44 @@ async function postJobAnswer(body) {
 // the queue moves on at once. A workspace already running JOBS_PARALLEL of its own jobs leaves the
 // row queued; the next one starts when one of THAT workspace's jobs ends, so the lanes wait only
 // on themselves.
+// git with an argument array and no shell, so no path or name is ever parsed by a shell.
+function git(cwd, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, { cwd });
+    let err = '';
+    child.stderr.on('data', (c) => (err += c));
+    child.on('error', reject);
+    child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`git ${args[0]} exited ${code}: ${err.trim().slice(0, 300)}`))));
+  });
+}
+
+// A repo job's own checkout: a fresh worktree of the repo, cut from the base branch as it is on
+// GitHub right now (not from whatever the main checkout here happens to hold).
+async function addJobWorktree(repoDir, base, id) {
+  const name = `studio-${new Date().toISOString().slice(0, 10)}-${String(id).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8)}`;
+  const dir = path.join(repoDir, '.claude', 'worktrees', name);
+  await git(repoDir, ['fetch', 'origin', base, '--quiet']);
+  await git(repoDir, ['worktree', 'add', dir, '-b', `task/${name}`, `origin/${base}`]);
+  return dir;
+}
+
+// After the run. Never --force: a worktree the job left with uncommitted changes is kept, so
+// unfinished work is never thrown away; git refuses and we only log it.
+async function removeJobWorktree(repoDir, dir) {
+  try {
+    await git(repoDir, ['worktree', 'remove', dir]);
+    log(`removed job worktree ${dir}`);
+  } catch (e) {
+    log(`kept job worktree ${dir} (${e.message})`);
+  }
+}
+
 async function startJob(item, cwd) {
   const { id, workspace, prompt, permission_mode: permissionMode, conversation_id: conversationId, source } = item;
   const lane = String(workspace).toLowerCase();
-  const minutes = JOBS_WORKSPACES.get(lane);
-  if (minutes !== undefined && runningIn(lane) >= JOBS_PARALLEL) return false;
+  const conf = jobLane(lane);
+  const minutes = conf?.minutes;
+  if (conf && runningIn(lane) >= JOBS_PARALLEL) return false;
   let claimed;
   try {
     const res = await hub('PATCH', { body: { id, status: 'processing' } });
@@ -533,19 +614,31 @@ async function startJob(item, cwd) {
     return false;
   }
   if (!claimed) { log(`skip ${id}: already claimed by another consumer`); return false; }
-  // FAIL-CLOSED both ways: a job workspace runs only an explicit 'full' row from a job source,
+  // FAIL-CLOSED both ways: a job workspace runs only an explicit 'full' row from ITS OWN sources,
   // and a job source reaches no other workspace.
-  if (minutes === undefined || permissionMode !== 'full' || !JOBS_SOURCES.includes(source)) {
-    const why = minutes === undefined
-      ? `source '${source}' may only use the job workspaces`
-      : `the ${workspace} workspace runs only 'full' rows from ${JOBS_SOURCES.join(', ')}`;
+  if (!conf || permissionMode !== 'full' || !conf.sources.includes(source)) {
+    const why = !conf
+      ? `source '${source}' may only use its job workspace`
+      : `the ${workspace} workspace runs only 'full' rows from ${conf.sources.join(', ') || '(no source)'}`;
     log(`FAIL ${id}: ${why}`);
     try { await hub('PATCH', { body: { id, status: 'failed', error: why } }); } catch {}
     return true;
   }
-  const dir = path.join(cwd, `${new Date().toISOString().slice(0, 10)}-${String(id).slice(0, 8)}`);
+  const jobName = `${new Date().toISOString().slice(0, 10)}-${String(id).slice(0, 8)}`;
+  // Plain jobs work in a new subfolder, which also holds RESULT.*. A repo job works in a worktree
+  // of the project and keeps RESULT.* in a folder of its own outside it.
+  let dir;
+  let answerDir;
   try {
-    fs.mkdirSync(dir, { recursive: true });
+    if (conf.repo) {
+      answerDir = path.join(REPO_RESULTS_DIR, jobName);
+      fs.mkdirSync(answerDir, { recursive: true });
+      dir = await addJobWorktree(cwd, conf.base, id);
+    } else {
+      dir = path.join(cwd, jobName);
+      fs.mkdirSync(dir, { recursive: true });
+      answerDir = dir;
+    }
   } catch (e) {
     log(`FAIL ${id}: no job folder (${e.message})`);
     try { await hub('PATCH', { body: { id, status: 'failed', error: `no job folder: ${e.message}`.slice(0, 500) } }); } catch {}
@@ -555,21 +648,22 @@ async function startJob(item, cwd) {
   log(`job ${id} ws=${workspace} src=${source} [full, ${minutes} min] in ${dir} (${String(prompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
   (async () => {
     try {
-      const { timedOut, stopped, text, sessionId } = await runJob(dir, prompt, minutes, rulesFor(workspace));
+      const rules = conf.repo ? REPO_RULES_FILE : rulesFor(workspace);
+      const { timedOut, stopped, text, sessionId } = await runJob(dir, prompt, minutes, rules, conf.repo ? answerDir : '');
       let response = text;
       if (timedOut) {
         // A run that was stopped may still have finished its work: the answer file is written the
         // moment the job has an answer, long before it composes its last message. Prefer it over
         // reporting a failure about work that is already pushed.
         let answer = '';
-        try { answer = fs.readFileSync(path.join(dir, JOB_ANSWER_FILE), 'utf8').trim(); } catch {}
+        try { answer = fs.readFileSync(path.join(answerDir, JOB_ANSWER_FILE), 'utf8').trim(); } catch {}
         try { if (answer) JSON.parse(answer); } catch { answer = ''; }
         if (answer) {
           response = answer;
           log(`job ${id}: stopped (${stopped}) but ${JOB_ANSWER_FILE} was already written — posting it as the answer`);
         } else {
           let partial = '';
-          try { partial = fs.readFileSync(path.join(dir, JOB_RESULT_FILE), 'utf8').slice(0, JOB_RESULT_MAX); } catch {}
+          try { partial = fs.readFileSync(path.join(answerDir, JOB_RESULT_FILE), 'utf8').slice(0, JOB_RESULT_MAX); } catch {}
           response = JSON.stringify({ timed_out: true, minutes, stopped, report: partial });
           log(`job ${id}: stopped (${stopped}), posting ${partial.length} chars of ${JOB_RESULT_FILE}`);
         }
@@ -582,6 +676,7 @@ async function startJob(item, cwd) {
       try { await hub('PATCH', { body: { id, status: 'failed', error: String(e.message).slice(0, 500) } }); } catch {}
     } finally {
       runningJobs.delete(id);
+      if (conf.repo) await removeJobWorktree(cwd, dir);
       setTimeout(tick, 500); // a job that waited for the slot starts now
     }
   })();
@@ -595,10 +690,12 @@ async function processItem(item) {
   const { id, workspace, prompt, parent_session_id: parentSessionId, permission_mode: permissionMode, conversation_id: conversationId, source } = item;
   if (WORKSPACE_ALLOWLIST.length && !WORKSPACE_ALLOWLIST.includes(workspace)) return false;
   if (SOURCE_ALLOWLIST.length && !SOURCE_ALLOWLIST.includes(source)) return false;
-  const cwd = resolveWorkspaceDir(workspace);
-  if (!cwd) { log(`skip ${id}: no dir for workspace '${workspace}' under PROJECT_DIRS`); return false; }
+  // A repo lane has no folder of its own: its jobs run in worktrees of the repo it names.
+  const repoLane = REPO_JOBS.get(String(workspace).toLowerCase());
+  const cwd = resolveWorkspaceDir(repoLane ? repoLane.repo : workspace);
+  if (!cwd) { log(`skip ${id}: no dir for workspace '${repoLane ? repoLane.repo : workspace}' under PROJECT_DIRS`); return false; }
   // A job workspace, or a job source anywhere (failed there): the jobs lane, in the background.
-  if (JOBS_WORKSPACES.has(String(workspace).toLowerCase()) || JOBS_SOURCES.includes(source)) {
+  if (jobLane(workspace) || isJobSource(source)) {
     return startJob(item, cwd);
   }
 
@@ -809,7 +906,7 @@ function connectDoorbell() {
   });
 }
 
-log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · model=${CLAUDE_MODEL || '(CLI default)'} · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}] · jobs=[${[...JOBS_WORKSPACES].map(([w, m]) => `${w}:${m}m`).join(',')}]×${JOBS_PARALLEL} each from [${JOBS_SOURCES.join(',')}]`);
+log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · model=${CLAUDE_MODEL || '(CLI default)'} · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}] · jobs=[${[...JOBS_WORKSPACES].map(([w, m]) => `${w}:${m}m`).join(',')}]×${JOBS_PARALLEL} each from [${JOBS_SOURCES.join(',')}] · repo-jobs=[${[...REPO_JOBS].map(([w, c]) => `${w}→${c.repo}@${c.base}:${c.minutes}m from [${(REPO_JOB_SOURCES.get(w) || []).join('|')}]`).join(',')}]`);
 maybeCatchup();                       // startup catchup (sets lastCatchupAt)
 setInterval(tick, FALLBACK_POLL_MS);  // safety net — Neon autosuspends between
 connectDoorbell();                    // primary push path
