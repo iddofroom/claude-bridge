@@ -80,6 +80,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkSignature } from './repo-jobs/signature.mjs';
 
 const SECRET = process.env.CCGRAM_WEBHOOK_SECRET;
 const WEB_APP_URL = (process.env.WEB_APP_URL || 'https://iddofroom.co.il').replace(/\/+$/, '');
@@ -519,9 +520,10 @@ function runJob(cwd, prompt, minutes, rulesFile = JOBS_RULES_FILE, resultDir = '
     let stopped = '';
     const settle = (fn, value) => { if (!settled) { settled = true; clearInterval(watch); clearTimeout(backstop); fn(value); } };
     // Checked once a minute: hung (nothing written for JOBS_IDLE_MIN), or past the absolute cap.
+    // A repo job's RESULT.* live outside its worktree, so that folder counts as activity too.
     let lastWrite = Date.now();
     const watch = setInterval(() => {
-      const written = newestWrite(cwd);
+      const written = Math.max(newestWrite(cwd), resultDir ? newestWrite(resultDir) : 0);
       if (written > lastWrite) lastWrite = written;
       const idleMin = (Date.now() - lastWrite) / 60000;
       const ranMin = (Date.now() - startedAt) / 60000;
@@ -567,15 +569,72 @@ async function postJobAnswer(body) {
 // the queue moves on at once. A workspace already running JOBS_PARALLEL of its own jobs leaves the
 // row queued; the next one starts when one of THAT workspace's jobs ends, so the lanes wait only
 // on themselves.
-// git with an argument array and no shell, so no path or name is ever parsed by a shell.
-function git(cwd, args) {
+// git with an argument array and no shell, so no path or name is ever parsed by a shell. It can
+// never wait for input (no stdin, no credential prompt) and is killed after `timeoutMs`, so a
+// hung fetch fails the one job instead of wedging the lane.
+function git(cwd, args, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
-    const child = spawn('git', args, { cwd });
+    const child = spawn('git', args, { cwd, stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
     let err = '';
+    let done = false;
+    const finish = (fn, v) => { if (!done) { done = true; clearTimeout(timer); fn(v); } };
+    const timer = setTimeout(() => { killTree(child); finish(reject, new Error(`git ${args[0]} timed out after ${Math.round(timeoutMs / 1000)}s`)); }, timeoutMs);
     child.stderr.on('data', (c) => (err += c));
-    child.on('error', reject);
-    child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`git ${args[0]} exited ${code}: ${err.trim().slice(0, 300)}`))));
+    child.on('error', (e) => finish(reject, e));
+    child.on('close', (code) => (code === 0 ? finish(resolve) : finish(reject, new Error(`git ${args[0]} exited ${code}: ${err.trim().slice(0, 300)}`))));
   });
+}
+
+// ── Signed repo-job prompts (repo-jobs/signature.mjs) ────────────────────────
+// A repo job must carry its caller's Ed25519 signature, verified with the public key committed at
+// repo-jobs/<lane>.pub.pem: the hub's shared secret alone cannot start a full-permission run here.
+// Fresh within REPO_JOBS_MAX_AGE_HOURS (default 72: the machine may be off over a weekend), and
+// each nonce runs once (repo-jobs-nonces.json in REPO_RESULTS_DIR).
+const REPO_JOBS_MAX_AGE_MS = Math.max(1, parseInt(process.env.REPO_JOBS_MAX_AGE_HOURS || '72', 10) || 72) * 3600000;
+const NONCES_FILE = path.join(REPO_RESULTS_DIR, 'repo-jobs-nonces.json');
+
+function readNonces() {
+  try { return JSON.parse(fs.readFileSync(NONCES_FILE, 'utf8')) || {}; } catch { return {}; }
+}
+
+// Returns { ok: true, body } (the prompt without its signature line) or { ok: false, why }.
+function verifySignedPrompt(lane, prompt) {
+  let pem;
+  try {
+    pem = fs.readFileSync(path.join(BRIDGE_DIR, 'repo-jobs', `${lane}.pub.pem`), 'utf8');
+  } catch (e) {
+    return { ok: false, why: `no public key for lane ${lane} (${e.message})` };
+  }
+  const v = checkSignature(prompt, lane, pem, REPO_JOBS_MAX_AGE_MS);
+  if (!v.ok) return v;
+  const { body, nonce } = v;
+  const nonces = readNonces();
+  if (nonces[nonce]) return { ok: false, why: `nonce ${nonce} already ran` };
+  const cutoff = Date.now() - 2 * REPO_JOBS_MAX_AGE_MS;
+  for (const [n, t] of Object.entries(nonces)) if (t < cutoff) delete nonces[n];
+  nonces[nonce] = Date.now();
+  try {
+    fs.mkdirSync(REPO_RESULTS_DIR, { recursive: true });
+    fs.writeFileSync(NONCES_FILE, JSON.stringify(nonces), 'utf8');
+  } catch (e) {
+    return { ok: false, why: `cannot record nonce (${e.message})` }; // fail closed: no replay record, no run
+  }
+  return { ok: true, body };
+}
+
+// Claim a row only to fail it, so a row that can never run does not stay queued and starve the
+// page it sits on. Returns true iff we claimed it.
+async function claimAndFail(id, why) {
+  try {
+    const res = await hub('PATCH', { body: { id, status: 'processing' } });
+    if (res?.claimed === false) return false;
+  } catch (e) {
+    log(`skip ${id}: claim failed (${e.message}) — left queued`);
+    return false;
+  }
+  log(`FAIL ${id}: ${why}`);
+  try { await hub('PATCH', { body: { id, status: 'failed', error: String(why).slice(0, 500) } }); } catch {}
+  return true;
 }
 
 // A repo job's own checkout: a fresh worktree of the repo, cut from the base branch as it is on
@@ -624,32 +683,42 @@ async function startJob(item, cwd) {
     try { await hub('PATCH', { body: { id, status: 'failed', error: why } }); } catch {}
     return true;
   }
-  const jobName = `${new Date().toISOString().slice(0, 10)}-${String(id).slice(0, 8)}`;
-  // Plain jobs work in a new subfolder, which also holds RESULT.*. A repo job works in a worktree
-  // of the project and keeps RESULT.* in a folder of its own outside it.
-  let dir;
-  let answerDir;
-  try {
-    if (conf.repo) {
-      answerDir = path.join(REPO_RESULTS_DIR, jobName);
-      fs.mkdirSync(answerDir, { recursive: true });
-      dir = await addJobWorktree(cwd, conf.base, id);
-    } else {
-      dir = path.join(cwd, jobName);
-      fs.mkdirSync(dir, { recursive: true });
-      answerDir = dir;
+  // A repo job must also carry its caller's signature (see verifySignedPrompt).
+  let jobPrompt = prompt;
+  if (conf.repo) {
+    const v = verifySignedPrompt(lane, prompt);
+    if (!v.ok) {
+      log(`FAIL ${id}: ${v.why}`);
+      try { await hub('PATCH', { body: { id, status: 'failed', error: `repo lane ${workspace}: ${v.why}` } }); } catch {}
+      return true;
     }
-  } catch (e) {
-    log(`FAIL ${id}: no job folder (${e.message})`);
-    try { await hub('PATCH', { body: { id, status: 'failed', error: `no job folder: ${e.message}`.slice(0, 500) } }); } catch {}
-    return true;
+    jobPrompt = v.body;
   }
+  const jobName = `${new Date().toISOString().slice(0, 10)}-${String(id).slice(0, 8)}`;
   runningJobs.set(id, lane);
-  log(`job ${id} ws=${workspace} src=${source} [full, ${minutes} min] in ${dir} (${String(prompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
   (async () => {
+    // Plain jobs work in a new subfolder, which also holds RESULT.*. A repo job works in a worktree
+    // of the project and keeps RESULT.* in a folder of its own outside it. Set up here, in the
+    // background, so a slow fetch never holds up the queue.
+    let dir;
+    let answerDir;
     try {
+      try {
+        if (conf.repo) {
+          answerDir = path.join(REPO_RESULTS_DIR, jobName);
+          fs.mkdirSync(answerDir, { recursive: true });
+          dir = await addJobWorktree(cwd, conf.base, id);
+        } else {
+          dir = path.join(cwd, jobName);
+          fs.mkdirSync(dir, { recursive: true });
+          answerDir = dir;
+        }
+      } catch (e) {
+        throw new Error(`no job folder: ${e.message}`);
+      }
+      log(`job ${id} ws=${workspace} src=${source} [full, ${minutes} min] in ${dir} (${String(jobPrompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
       const rules = conf.repo ? REPO_RULES_FILE : rulesFor(workspace);
-      const { timedOut, stopped, text, sessionId } = await runJob(dir, prompt, minutes, rules, conf.repo ? answerDir : '');
+      const { timedOut, stopped, text, sessionId } = await runJob(dir, jobPrompt, minutes, rules, conf.repo ? answerDir : '');
       let response = text;
       if (timedOut) {
         // A run that was stopped may still have finished its work: the answer file is written the
@@ -676,7 +745,7 @@ async function startJob(item, cwd) {
       try { await hub('PATCH', { body: { id, status: 'failed', error: String(e.message).slice(0, 500) } }); } catch {}
     } finally {
       runningJobs.delete(id);
-      if (conf.repo) await removeJobWorktree(cwd, dir);
+      if (conf.repo && dir) await removeJobWorktree(cwd, dir);
       setTimeout(tick, 500); // a job that waited for the slot starts now
     }
   })();
@@ -693,7 +762,10 @@ async function processItem(item) {
   // A repo lane has no folder of its own: its jobs run in worktrees of the repo it names.
   const repoLane = REPO_JOBS.get(String(workspace).toLowerCase());
   const cwd = resolveWorkspaceDir(repoLane ? repoLane.repo : workspace);
-  if (!cwd) { log(`skip ${id}: no dir for workspace '${repoLane ? repoLane.repo : workspace}' under PROJECT_DIRS`); return false; }
+  // A configured repo lane whose repo is missing can never run: fail the row rather than leave it
+  // queued, where a page of such rows would stop the drain from reaching later ones.
+  if (!cwd && repoLane) return claimAndFail(id, `repo lane ${workspace}: no '${repoLane.repo}' folder under PROJECT_DIRS`);
+  if (!cwd) { log(`skip ${id}: no dir for workspace '${workspace}' under PROJECT_DIRS`); return false; }
   // A job workspace, or a job source anywhere (failed there): the jobs lane, in the background.
   if (jobLane(workspace) || isJobSource(source)) {
     return startJob(item, cwd);

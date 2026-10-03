@@ -9,6 +9,8 @@ The owner, 2026-10-03: from the phone menu of bakbukim ("משימות לקלוד
 - A folder for `RESULT.md` / `RESULT.json` OUTSIDE the worktree (`%TEMP%\bridge-repo-jobs\<date>-<id>`), named at the end of the prompt. Inside the project, a run that stages with `git add -A` would commit them.
 - The jobs lane's stop rules: stopped after `JOBS_IDLE_MINUTES` without writing anything in the worktree, or at the lane's minutes as a backstop. A stopped run is still answered from `RESULT.json`, or from `RESULT.md`.
 - When the run ends, `git worktree remove` WITHOUT `--force`: a worktree that still holds uncommitted work is kept, and the log says so. Branches are left alone.
+- Git setup runs in the background (it never holds up the queue), can never prompt for credentials (`GIT_TERMINAL_PROMPT=0`, no stdin) and is killed after 2 minutes; a failure fails that one job.
+- The idle watcher counts writes in the worktree AND in the result folder.
 
 ## Configuration
 
@@ -17,7 +19,16 @@ The owner, 2026-10-03: from the phone menu of bakbukim ("משימות לקלוד
 | `REPO_JOBS` | `bakbukim-tasks:bakbukim:dev:240` | `lane:repo folder:base branch:minutes`, comma-separated |
 | `REPO_JOBS_SOURCES` | `bakbukim-tasks=bakbukim-owner-task` | `lane=source[\|source…]`, comma-separated |
 
-Fail-closed, like every job lane: a repo lane runs only rows with `permission_mode='full'` from its own sources; those sources are failed in every other workspace; פינגו's sources cannot reach a repo lane. The hub stores `'full'` only for the workspaces it allows that for (iddofroom `app/api/copilot/external/prompt`); everything else arrives with no mode, which this poller treats as read-only.
+Fail-closed, like every job lane: a repo lane runs only rows with `permission_mode='full'` from its own sources; those sources are failed in every other workspace; פינגו's sources cannot reach a repo lane. The hub stores `'full'` only for the workspaces it allows that for (iddofroom `app/api/copilot/external/prompt`); everything else arrives with no mode, which this poller treats as read-only. A configured repo lane whose repo folder is missing fails its rows instead of leaving them queued.
+
+## The signature (why the hub's secret is not enough)
+
+The hub authenticates every external caller with one shared secret and takes `workspace` and `source` from the request body, so any holder of that secret could name a repo lane. A repo job therefore also needs the caller's **Ed25519 signature** (`signature.mjs`): the caller signs the prompt with a private key only it holds (bakbukim: the Worker secret `BRIDGE_TASK_SIGNING_KEY`), and the poller verifies it with the public key committed here as `<lane>.pub.pem`. Nothing secret lives on this machine, and neither the hub nor a leaked hub secret can sign.
+
+- The prompt ends with `[[bridge-signature v1 ts=<ISO> nonce=<id> sig=<base64url>]]`, over `bridge-signature v1\n<lane>\n<ts>\n<nonce>\n<body>`. The poller strips that line before Claude sees the prompt.
+- Refused: unsigned, malformed, a bad signature, a signature for another lane, older or newer than `REPO_JOBS_MAX_AGE_HOURS` (default 72, so a weekend with the machine off still runs), a nonce that already ran (`%TEMP%\bridge-repo-jobs\repo-jobs-nonces.json`), or a lane with no `.pub.pem`.
+- Rotating the key: generate a new pair, put the private half in the caller's secret store and replace `<lane>.pub.pem` here; pull and restart the poller.
+- Tests: `node --test bridge/repo-jobs/signature.test.mjs`.
 
 ## On the bridge machine, once
 
