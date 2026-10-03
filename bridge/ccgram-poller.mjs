@@ -718,6 +718,9 @@ async function startJob(item, cwd) {
     const why = !conf
       ? `source '${source}' may only use its job workspace`
       : `the ${workspace} workspace runs only '${wantMode}' rows from ${conf.sources.join(', ') || '(no source)'}`;
+    // A repo caller (bakbukim) learns the outcome only from an answer: a bare 'failed' would
+    // leave its screen on "waiting" forever. פינגו's job rows keep the bare status.
+    if (conf?.repo || REPO_SOURCES_ALL.includes(source)) { await failWithAnswer(item, why); return true; }
     log(`FAIL ${id}: ${why}`);
     try { await hub('PATCH', { body: { id, status: 'failed', error: why } }); } catch {}
     return true;
