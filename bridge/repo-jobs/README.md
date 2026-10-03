@@ -18,6 +18,7 @@ The owner, 2026-10-03: from the phone menu of bakbukim ("משימות לקלוד
 |---|---|---|
 | `REPO_JOBS` | `bakbukim-tasks:bakbukim:dev:240` | `lane:repo folder:base branch:minutes`, comma-separated |
 | `REPO_JOBS_SOURCES` | `bakbukim-tasks=bakbukim-owner-task` | `lane=source[\|source…]`, comma-separated |
+| `SIGNED_FULL_SOURCES` | `bakbukim=bakbukim-manager-execute` | one-at-a-time queue rows that run full only when signed: `workspace=source[\|source…]` (see below) |
 
 Fail-closed, like every job lane: a repo lane runs only rows with `permission_mode='full'` from its own sources; those sources are failed in every other workspace; פינגו's sources cannot reach a repo lane. The hub stores `'full'` only for the workspaces it allows that for (iddofroom `app/api/copilot/external/prompt`); everything else arrives with no mode, which this poller treats as read-only. A configured repo lane whose repo folder is missing fails its rows instead of leaving them queued.
 
@@ -30,9 +31,17 @@ The hub authenticates every external caller with one shared secret and takes `wo
 - Rotating the key: generate a new pair, put the private half in the caller's secret store and replace `<lane>.pub.pem` here; pull and restart the poller.
 - Tests: `node --test bridge/repo-jobs/signature.test.mjs`.
 
+## Signed rows in the one-at-a-time queue ("בצע")
+
+bakbukim's "בצע" button (source `bakbukim-manager-execute`, workspace `bakbukim`) asks for a full run in the ordinary queue, in the project's main folder. From 2026-07-23, when this poller became fail-closed, until 2026-10-03, the hub stored no mode for it, so every "בצע" quietly ran read-only: Claude wrote a plan and changed nothing. Now the hub stores `'full'` for that pair, and the poller runs it full ONLY with a valid signature, lane name = the workspace (`bakbukim`), key `repo-jobs/bakbukim.pub.pem` (bakbukim signs both lanes with the same private key; the lane line in the signed message keeps a signature for one lane from being replayed in the other). Unsigned or bad: the row is answered and failed, never downgraded to a silent read-only run.
+
+## Refusals are answered
+
+The hub fires the caller's `callback_url` only on an answer, never on a bare `failed` status. So a repo job that is refused (signature, missing repo folder) or fails before it answers, and a refused signed row, now post a short answer, ```` ```json {"status":"failed","summary":"המחשב בסטודיו לא הריץ את המשימה: <why>"} ``` ```` and then the `failed` status. Without it the caller's screen showed "waiting" forever.
+
 ## On the bridge machine, once
 
-1. Pull claude-bridge (`dev`) and restart the poller. The startup line now ends with `repo-jobs=[bakbukim-tasks→bakbukim@dev:240m from [bakbukim-owner-task]]`.
-2. If `.env` sets `WORKSPACE_ALLOWLIST` or `SOURCE_ALLOWLIST`, add `bakbukim-tasks` and `bakbukim-owner-task` to them.
+1. Pull claude-bridge (`dev`) and restart the poller. The startup line now ends with `repo-jobs=[bakbukim-tasks→bakbukim@dev:240m from [bakbukim-owner-task]] signed-full=[bakbukim:bakbukim-manager-execute]`.
+2. If `.env` sets `WORKSPACE_ALLOWLIST` or `SOURCE_ALLOWLIST`, add `bakbukim-tasks`, `bakbukim-owner-task` and `bakbukim-manager-execute` to them.
 3. The bakbukim checkout under `PROJECT_DIRS` must be a git clone with `node_modules` installed and a GitHub login that can push to it (`gh auth status`).
 4. Check that a print run may use full permissions: `claude -p --permission-mode bypassPermissions "reply with the word ok"`.

@@ -203,6 +203,24 @@ function jobLane(workspace) {
   return minutes === undefined ? null : { minutes, sources: JOBS_SOURCES };
 }
 const REPO_SOURCES_ALL = [...REPO_JOB_SOURCES.values()].flat();
+// One-at-a-time queue rows that run with full permissions ONLY when signed (first user: the
+// owner's "בצע" button in bakbukim, 2026-10-03). The hub stores 'full' for these workspace/source
+// pairs; the signature (verifySignedPrompt, lane name = the workspace, key repo-jobs/<workspace>.pub.pem)
+// is what proves the caller, so a holder of the hub's shared secret alone cannot get a full run.
+//   SIGNED_FULL_SOURCES  default "bakbukim=bakbukim-manager-execute" — workspace=source[|source…], comma-separated
+const SIGNED_FULL_SOURCES = new Map(
+  (process.env.SIGNED_FULL_SOURCES ?? 'bakbukim=bakbukim-manager-execute')
+    .split(',').map((s) => s.trim()).filter(Boolean)
+    .map((s) => {
+      const [lane, sources = ''] = s.split('=');
+      return [lane.trim().toLowerCase(), sources.split('|').map((x) => x.trim()).filter(Boolean)];
+    })
+    .filter(([lane]) => LANE_NAME_RE.test(lane)),
+);
+function signedFullLane(workspace, source) {
+  const lane = String(workspace).toLowerCase();
+  return (SIGNED_FULL_SOURCES.get(lane) || []).includes(source) ? lane : null;
+}
 const isJobSource = (source) => JOBS_SOURCES.includes(source) || REPO_SOURCES_ALL.includes(source);
 // The owner, 2026-09-18: "צריך להוריד את המגבלה של הזמן - ושהיא תסתיים". So the clock that stops a
 // run is no longer a clock on the work but on doing nothing: a run that has not written a byte
@@ -622,18 +640,28 @@ function verifySignedPrompt(lane, prompt) {
   return { ok: true, body };
 }
 
+// Fail a claimed row AND answer it. A bare 'failed' status never reaches the caller (the hub fires
+// callback_url only on an answer), so a refused repo job or a refused signed run would otherwise
+// show "waiting" on the caller's screen forever. One attempt: this may run on the queue's path.
+async function failWithAnswer(item, why) {
+  const { id, workspace, conversation_id: conversationId } = item;
+  log(`FAIL ${id}: ${why}`);
+  const response = '```json\n' + JSON.stringify({ status: 'failed', summary: `המחשב בסטודיו לא הריץ את המשימה: ${why}` }) + '\n```';
+  try { await hub('POST', { body: { workspace, response, conversation_id: conversationId, outbox_id: id } }); } catch (e) { log(`${id}: could not post the refusal (${e.message})`); }
+  try { await hub('PATCH', { body: { id, status: 'failed', error: String(why).slice(0, 500) } }); } catch {}
+}
+
 // Claim a row only to fail it, so a row that can never run does not stay queued and starve the
 // page it sits on. Returns true iff we claimed it.
-async function claimAndFail(id, why) {
+async function claimAndFail(item, why) {
   try {
-    const res = await hub('PATCH', { body: { id, status: 'processing' } });
+    const res = await hub('PATCH', { body: { id: item.id, status: 'processing' } });
     if (res?.claimed === false) return false;
   } catch (e) {
-    log(`skip ${id}: claim failed (${e.message}) — left queued`);
+    log(`skip ${item.id}: claim failed (${e.message}) — left queued`);
     return false;
   }
-  log(`FAIL ${id}: ${why}`);
-  try { await hub('PATCH', { body: { id, status: 'failed', error: String(why).slice(0, 500) } }); } catch {}
+  await failWithAnswer(item, why);
   return true;
 }
 
@@ -688,8 +716,7 @@ async function startJob(item, cwd) {
   if (conf.repo) {
     const v = verifySignedPrompt(lane, prompt);
     if (!v.ok) {
-      log(`FAIL ${id}: ${v.why}`);
-      try { await hub('PATCH', { body: { id, status: 'failed', error: `repo lane ${workspace}: ${v.why}` } }); } catch {}
+      await failWithAnswer(item, `repo lane ${workspace}: ${v.why}`);
       return true;
     }
     jobPrompt = v.body;
@@ -702,6 +729,7 @@ async function startJob(item, cwd) {
     // background, so a slow fetch never holds up the queue.
     let dir;
     let answerDir;
+    let answered = false;
     try {
       try {
         if (conf.repo) {
@@ -738,11 +766,16 @@ async function startJob(item, cwd) {
         }
       }
       await postJobAnswer({ workspace, response, claude_session_id: sessionId, conversation_id: conversationId, outbox_id: id });
+      answered = true;
       await hub('PATCH', { body: { id, status: 'sent' } });
       log(`job done ${id}`);
     } catch (e) {
-      log(`job FAIL ${id}: ${e.message}`);
-      try { await hub('PATCH', { body: { id, status: 'failed', error: String(e.message).slice(0, 500) } }); } catch {}
+      // A repo job's caller waits on its callback: tell it (unless it already has its answer).
+      if (conf.repo && !answered) await failWithAnswer(item, String(e.message).slice(0, 500));
+      else {
+        log(`job FAIL ${id}: ${e.message}`);
+        try { await hub('PATCH', { body: { id, status: 'failed', error: String(e.message).slice(0, 500) } }); } catch {}
+      }
     } finally {
       runningJobs.delete(id);
       if (conf.repo && dir) await removeJobWorktree(cwd, dir);
@@ -764,7 +797,7 @@ async function processItem(item) {
   const cwd = resolveWorkspaceDir(repoLane ? repoLane.repo : workspace);
   // A configured repo lane whose repo is missing can never run: fail the row rather than leave it
   // queued, where a page of such rows would stop the drain from reaching later ones.
-  if (!cwd && repoLane) return claimAndFail(id, `repo lane ${workspace}: no '${repoLane.repo}' folder under PROJECT_DIRS`);
+  if (!cwd && repoLane) return claimAndFail(item, `repo lane ${workspace}: no '${repoLane.repo}' folder under PROJECT_DIRS`);
   if (!cwd) { log(`skip ${id}: no dir for workspace '${workspace}' under PROJECT_DIRS`); return false; }
   // A job workspace, or a job source anywhere (failed there): the jobs lane, in the background.
   if (jobLane(workspace) || isJobSource(source)) {
@@ -796,6 +829,16 @@ async function processItem(item) {
   // unknown / a dropped field ⇒ read-only. The most dangerous default (full) must
   // never be the fallback for the most dangerous (untrusted) input.
   const readOnly = permissionMode !== 'full';
+  // A signed source's full run must prove its caller (see SIGNED_FULL_SOURCES); refused, it is
+  // answered and failed, never quietly downgraded: a silent read-only run is what hid the broken
+  // "בצע" from 2026-07-23 to 2026-10-03.
+  let runPrompt = prompt;
+  const signedLane = readOnly ? null : signedFullLane(workspace, source);
+  if (signedLane) {
+    const v = verifySignedPrompt(signedLane, prompt);
+    if (!v.ok) { await failWithAnswer(item, `${workspace}/${source}: ${v.why}`); return true; }
+    runPrompt = v.body;
+  }
   // Browser mode drives a logged-in Chrome, so it is never a fallback either: only
   // owner-authored sources get it, and a row explicitly marked read_only (untrusted
   // input) never does. The hub also refuses this workspace on its external API.
@@ -805,10 +848,10 @@ async function processItem(item) {
     try { await hub('PATCH', { body: { id, status: 'failed', error: `the ${BROWSER_WORKSPACE} workspace is not available to source '${source || '?'}'` } }); } catch {}
     return true;
   }
-  log(`run ${id} ws=${workspace} src=${source || '?'} ${browser ? '[browser]' : readOnly ? '[read-only]' : '[full]'} (${String(prompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
+  log(`run ${id} ws=${workspace} src=${source || '?'} ${browser ? '[browser]' : readOnly ? '[read-only]' : signedLane ? '[full, signed]' : '[full]'} (${String(runPrompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
   try {
     if (browser) await prepareBrowser();
-    const { text, sessionId, denials } = await runClaude(cwd, prompt, { readOnly, browser, parentSessionId });
+    const { text, sessionId, denials } = await runClaude(cwd, runPrompt, { readOnly, browser, parentSessionId });
     if (denials.length) log(`${id}: permission denied → ${denials.join(', ')}`);
     await hub('POST', { body: { workspace, response: text, claude_session_id: sessionId, conversation_id: conversationId, outbox_id: id } });
     await hub('PATCH', { body: { id, status: 'sent' } });
@@ -978,7 +1021,7 @@ function connectDoorbell() {
   });
 }
 
-log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · model=${CLAUDE_MODEL || '(CLI default)'} · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}] · jobs=[${[...JOBS_WORKSPACES].map(([w, m]) => `${w}:${m}m`).join(',')}]×${JOBS_PARALLEL} each from [${JOBS_SOURCES.join(',')}] · repo-jobs=[${[...REPO_JOBS].map(([w, c]) => `${w}→${c.repo}@${c.base}:${c.minutes}m from [${(REPO_JOB_SOURCES.get(w) || []).join('|')}]`).join(',')}]`);
+log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · model=${CLAUDE_MODEL || '(CLI default)'} · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}] · jobs=[${[...JOBS_WORKSPACES].map(([w, m]) => `${w}:${m}m`).join(',')}]×${JOBS_PARALLEL} each from [${JOBS_SOURCES.join(',')}] · repo-jobs=[${[...REPO_JOBS].map(([w, c]) => `${w}→${c.repo}@${c.base}:${c.minutes}m from [${(REPO_JOB_SOURCES.get(w) || []).join('|')}]`).join(',')}] signed-full=[${[...SIGNED_FULL_SOURCES].map(([w, s]) => `${w}:${s.join('|')}`).join(',')}]`);
 maybeCatchup();                       // startup catchup (sets lastCatchupAt)
 setInterval(tick, FALLBACK_POLL_MS);  // safety net — Neon autosuspends between
 connectDoorbell();                    // primary push path
