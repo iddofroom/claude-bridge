@@ -204,7 +204,7 @@ function jobLane(workspace) {
 }
 const REPO_SOURCES_ALL = [...REPO_JOB_SOURCES.values()].flat();
 // One-at-a-time queue rows that run with full permissions ONLY when signed (first user: the
-// owner's "בצע" button in bakbukim, 2026-10-03). The hub stores 'full' for these workspace/source
+// owner's "בצע" button in bakbukim, 2026-10-03). The hub stores 'signed_full' for these workspace/source
 // pairs; the signature (verifySignedPrompt, lane name = the workspace, key repo-jobs/<workspace>.pub.pem)
 // is what proves the caller, so a holder of the hub's shared secret alone cannot get a full run.
 //   SIGNED_FULL_SOURCES  default "bakbukim=bakbukim-manager-execute" — workspace=source[|source…], comma-separated
@@ -607,12 +607,23 @@ function git(cwd, args, timeoutMs = 120000) {
 // A repo job must carry its caller's Ed25519 signature, verified with the public key committed at
 // repo-jobs/<lane>.pub.pem: the hub's shared secret alone cannot start a full-permission run here.
 // Fresh within REPO_JOBS_MAX_AGE_HOURS (default 72: the machine may be off over a weekend), and
-// each nonce runs once (repo-jobs-nonces.json in REPO_RESULTS_DIR).
+// each nonce runs once (one marker file per nonce in REPO_RESULTS_DIR/repo-jobs-nonces).
 const REPO_JOBS_MAX_AGE_MS = Math.max(1, parseInt(process.env.REPO_JOBS_MAX_AGE_HOURS || '72', 10) || 72) * 3600000;
-const NONCES_FILE = path.join(REPO_RESULTS_DIR, 'repo-jobs-nonces.json');
+const NONCES_DIR = path.join(REPO_RESULTS_DIR, 'repo-jobs-nonces');
 
-function readNonces() {
-  try { return JSON.parse(fs.readFileSync(NONCES_FILE, 'utf8')) || {}; } catch { return {}; }
+// Claim a nonce with an exclusive create ('wx'): atomic on the filesystem, so two pollers (or two
+// copies of one prompt) can never both pass. Throws EEXIST when the nonce already ran. Markers
+// older than twice the signature's max age are pruned; such a signature is refused by age anyway.
+function claimNonce(nonce) {
+  fs.mkdirSync(NONCES_DIR, { recursive: true });
+  try {
+    const cutoff = Date.now() - 2 * REPO_JOBS_MAX_AGE_MS;
+    for (const name of fs.readdirSync(NONCES_DIR)) {
+      const p = path.join(NONCES_DIR, name);
+      try { if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p); } catch {}
+    }
+  } catch {}
+  fs.writeFileSync(path.join(NONCES_DIR, nonce), String(Date.now()), { flag: 'wx' });
 }
 
 // Returns { ok: true, body } (the prompt without its signature line) or { ok: false, why }.
@@ -626,15 +637,10 @@ function verifySignedPrompt(lane, prompt) {
   const v = checkSignature(prompt, lane, pem, REPO_JOBS_MAX_AGE_MS);
   if (!v.ok) return v;
   const { body, nonce } = v;
-  const nonces = readNonces();
-  if (nonces[nonce]) return { ok: false, why: `nonce ${nonce} already ran` };
-  const cutoff = Date.now() - 2 * REPO_JOBS_MAX_AGE_MS;
-  for (const [n, t] of Object.entries(nonces)) if (t < cutoff) delete nonces[n];
-  nonces[nonce] = Date.now();
   try {
-    fs.mkdirSync(REPO_RESULTS_DIR, { recursive: true });
-    fs.writeFileSync(NONCES_FILE, JSON.stringify(nonces), 'utf8');
+    claimNonce(nonce);
   } catch (e) {
+    if (e?.code === 'EEXIST') return { ok: false, why: `nonce ${nonce} already ran` };
     return { ok: false, why: `cannot record nonce (${e.message})` }; // fail closed: no replay record, no run
   }
   return { ok: true, body };
@@ -671,7 +677,9 @@ async function addJobWorktree(repoDir, base, id) {
   const name = `studio-${new Date().toISOString().slice(0, 10)}-${String(id).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8)}`;
   const dir = path.join(repoDir, '.claude', 'worktrees', name);
   await git(repoDir, ['fetch', 'origin', base, '--quiet']);
-  await git(repoDir, ['worktree', 'add', dir, '-b', `task/${name}`, `origin/${base}`]);
+  // --no-track: the task branch must not take origin/<base> as its upstream, or a plain `git push`
+  // there would fail (push.default=simple) or push the job's commits straight to the base branch.
+  await git(repoDir, ['worktree', 'add', '--no-track', '-b', `task/${name}`, dir, `origin/${base}`]);
   return dir;
 }
 
@@ -701,12 +709,15 @@ async function startJob(item, cwd) {
     return false;
   }
   if (!claimed) { log(`skip ${id}: already claimed by another consumer`); return false; }
-  // FAIL-CLOSED both ways: a job workspace runs only an explicit 'full' row from ITS OWN sources,
-  // and a job source reaches no other workspace.
-  if (!conf || permissionMode !== 'full' || !conf.sources.includes(source)) {
+  // FAIL-CLOSED both ways: a job workspace runs only an explicit full row from ITS OWN sources,
+  // and a job source reaches no other workspace. A repo lane takes only 'signed_full': a mode an
+  // older poller does not know, so it runs read-only there instead of full without a signature
+  // check (mixed versions during a rollout, or a bridge rollback).
+  const wantMode = conf?.repo ? 'signed_full' : 'full';
+  if (!conf || permissionMode !== wantMode || !conf.sources.includes(source)) {
     const why = !conf
       ? `source '${source}' may only use its job workspace`
-      : `the ${workspace} workspace runs only 'full' rows from ${conf.sources.join(', ') || '(no source)'}`;
+      : `the ${workspace} workspace runs only '${wantMode}' rows from ${conf.sources.join(', ') || '(no source)'}`;
     log(`FAIL ${id}: ${why}`);
     try { await hub('PATCH', { body: { id, status: 'failed', error: why } }); } catch {}
     return true;
@@ -825,20 +836,26 @@ async function processItem(item) {
   if (!sync.ok) log(`git pull failed for ${workspace} (${cwd}) — continuing with existing checkout: ${sync.error}`);
   else if (!sync.skipped) log(`synced ${workspace}`);
 
-  // FAIL-CLOSED: only an explicit 'full' grants full capability. read_only / null /
-  // unknown / a dropped field ⇒ read-only. The most dangerous default (full) must
-  // never be the fallback for the most dangerous (untrusted) input.
-  const readOnly = permissionMode !== 'full';
-  // A signed source's full run must prove its caller (see SIGNED_FULL_SOURCES); refused, it is
-  // answered and failed, never quietly downgraded: a silent read-only run is what hid the broken
-  // "בצע" from 2026-07-23 to 2026-10-03.
+  // FAIL-CLOSED: only an explicit 'full', or a verified 'signed_full', grants full capability.
+  // read_only / null / unknown / a dropped field ⇒ read-only. The most dangerous default (full)
+  // must never be the fallback for the most dangerous (untrusted) input.
+  // A signed source runs full only as 'signed_full' with a valid signature (see
+  // SIGNED_FULL_SOURCES); refused, it is answered and failed, never quietly downgraded: a silent
+  // read-only run is what hid the broken "בצע" from 2026-07-23 to 2026-10-03. The hub stores
+  // 'signed_full' (not 'full') for these pairs so an older poller, which knows only 'full', runs
+  // such a row read-only instead of full without checking the signature.
   let runPrompt = prompt;
-  const signedLane = readOnly ? null : signedFullLane(workspace, source);
-  if (signedLane) {
+  const signedLane = signedFullLane(workspace, source);
+  if (permissionMode === 'signed_full') {
+    if (!signedLane) { await failWithAnswer(item, `'signed_full' is not allowed for ${workspace}/${source}`); return true; }
     const v = verifySignedPrompt(signedLane, prompt);
     if (!v.ok) { await failWithAnswer(item, `${workspace}/${source}: ${v.why}`); return true; }
     runPrompt = v.body;
+  } else if (permissionMode === 'full' && signedLane) {
+    await failWithAnswer(item, `${workspace}/${source} runs full only as a signed 'signed_full' row`);
+    return true;
   }
+  const readOnly = permissionMode !== 'full' && permissionMode !== 'signed_full';
   // Browser mode drives a logged-in Chrome, so it is never a fallback either: only
   // owner-authored sources get it, and a row explicitly marked read_only (untrusted
   // input) never does. The hub also refuses this workspace on its external API.
