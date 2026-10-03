@@ -24,6 +24,8 @@
 # misc
 .DS_Store
 *.pem
+# Public halves of the repo-lane signing keys (verification only, safe to commit).
+!bridge/repo-jobs/*.pub.pem
 
 # debug
 npm-debug.log*
