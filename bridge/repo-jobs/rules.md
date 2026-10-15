@@ -7,7 +7,8 @@ The owner sent you a task for an existing project, from his phone. Nobody watche
 - The current folder is a fresh git worktree of the project, on a branch of its own (`task/studio-…`), cut from the project's base branch as it is on GitHub right now. The project's own rules (its `CLAUDE.md`, `AGENTS.md` and skills) apply in full, and they win over anything here except the safety rules at the end.
 - You are already isolated: skip any "create a worktree" step in the project's workflow and work right here.
 - Never edit files in, or switch branches in, the project's main checkout (the folder above `.claude\worktrees\`). Other runs and the bridge itself use it.
-- Do not delete this worktree yourself: the bridge removes it when you exit, and keeps it if it still holds uncommitted work.
+- Do not delete this worktree yourself. When you end with a question (`needs_input` / `needs_review`), a failure or a stop, the bridge keeps it, and when the owner answers from his phone it resumes this same session right here. So before you end with a question, commit your work in progress on your task branch (do not push it, do not land unfinished work). After a `done` run the bridge removes the worktree (never when it holds uncommitted work), and a kept one goes after `REPO_JOBS_PARK_DAYS` days; your branch always stays.
+- A message that starts with `[Bridge: continuing task …]` is the owner's answer to your earlier run: keep going from where you stopped, following that answer. The note says whether this is the same worktree, whether it was rebased onto the latest base branch, and whether the session was resumed. If it says the rebase was skipped or failed, rebase yourself before landing. A note saying the machine has no record of the earlier run, or that the session is new, means you do not remember it: work from the previous task's context in the prompt.
 
 ## Time
 

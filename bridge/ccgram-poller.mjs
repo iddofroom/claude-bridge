@@ -55,6 +55,8 @@
  *                           (see syncWorkspace). Set to "false" to disable.
  *   REPO_JOBS / REPO_JOBS_SOURCES  repo lanes: full-permission jobs that change an existing
  *                           project, each in a fresh worktree of it (bridge/repo-jobs/README.md).
+ *   REPO_JOBS_STATE_DIR / REPO_JOBS_PARK_DAYS  continuing a repo job: the owner's answer resumes
+ *                           the same session in the same worktree (README "Continuing a job").
  *                           Defaults give bakbukim one lane, "bakbukim-tasks", fed only by
  *                           source "bakbukim-owner-task". A WORKSPACE_ALLOWLIST / SOURCE_ALLOWLIST,
  *                           if set, must name them too.
@@ -81,6 +83,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkSignature } from './repo-jobs/signature.mjs';
+import {
+  answerStatus, claimContinuation, isContinued, isNoSessionError, nonceKey, normPath, parseContinue,
+  prepareWorktree, readRecord, shouldPark, sweepMarked, sweepParked, syncWorktree, writeRecord,
+} from './repo-jobs/continuation.mjs';
 
 const SECRET = process.env.CCGRAM_WEBHOOK_SECRET;
 const WEB_APP_URL = (process.env.WEB_APP_URL || 'https://iddofroom.co.il').replace(/\/+$/, '');
@@ -194,6 +200,15 @@ const REPO_JOB_SOURCES = new Map(
 );
 const REPO_RULES_FILE = path.join(BRIDGE_DIR, 'repo-jobs', 'rules.md');
 const REPO_RESULTS_DIR = path.join(process.env.TEMP || process.env.TMP || process.cwd(), 'bridge-repo-jobs');
+// Continuing a job (repo-jobs/continuation.mjs, README "Continuing a job"): each repo job's record
+// (worktree, branch, session id) and the one-continuation-per-task markers. Not under %TEMP%: Storage
+// Sense may empty it, and a lost continued-* marker would let a task be continued twice.
+//   REPO_JOBS_STATE_DIR   default %LOCALAPPDATA%\claude-bridge\repo-jobs
+//   REPO_JOBS_PARK_DAYS   default 7. A job that ended with a question, a failure or a stop keeps its
+//                         worktree this long for the owner's answer; then it is removed (never forced).
+const REPO_STATE_DIR = process.env.REPO_JOBS_STATE_DIR
+  || path.join(process.env.LOCALAPPDATA || process.env.HOME || process.cwd(), 'claude-bridge', 'repo-jobs');
+const REPO_JOBS_PARK_DAYS = Math.max(1, parseInt(process.env.REPO_JOBS_PARK_DAYS || '7', 10) || 7);
 // Which lane a workspace is, if any: { minutes, sources, repo?, base? }.
 function jobLane(workspace) {
   const lane = String(workspace).toLowerCase();
@@ -229,6 +244,7 @@ const isJobSource = (source) => JOBS_SOURCES.includes(source) || REPO_SOURCES_AL
 const JOBS_IDLE_MIN = Math.max(2, parseInt(process.env.JOBS_IDLE_MINUTES || '25', 10) || 25);
 const runningJobs = new Map(); // outbox id → the workspace it is running in
 const runningIn = (ws) => [...runningJobs.values()].filter((w) => w === ws).length;
+const runningDirs = new Set(); // normPath of every repo worktree a job of this process is using
 const ENDPOINT = `${WEB_APP_URL}/api/copilot/webhooks/ccgram`;
 // WebSocket doorbell endpoint on the hub. http→ws / https→wss.
 const WS_URL = `${WEB_APP_URL.replace(/^http/, 'ws')}/api/copilot/bridge/socket`;
@@ -526,11 +542,17 @@ function newestWrite(dir, budget = 20000) {
 // the built-in tools, still no MCP servers, jobs/rules.md appended. It is stopped when it has gone
 // JOBS_IDLE_MIN without writing anything, or when it passes `minutes` outright (the backstop). A
 // run that is stopped resolves with timedOut, never rejects, so its answer is still posted.
-function runJob(cwd, prompt, minutes, rulesFile = JOBS_RULES_FILE, resultDir = '') {
+// opts.resumeSessionId continues that Claude session; else opts.sessionId starts the run under that
+// id, so the bridge knows the session even when the run is stopped before it prints anything.
+// Both are UUID-gated: nothing else ever reaches the argv.
+function runJob(cwd, prompt, minutes, rulesFile = JOBS_RULES_FILE, resultDir = '', opts = {}) {
   return new Promise((resolve, reject) => {
     const args = ['--print', '--output-format', 'json', '--strict-mcp-config', '--permission-mode', 'bypassPermissions', '--append-system-prompt-file', rulesFile];
     const model = JOBS_MODEL || CLAUDE_MODEL;
     if (model) args.push('--model', model);
+    const known = [opts.resumeSessionId, opts.sessionId].find((s) => typeof s === 'string' && UUID_RE.test(s)) || null;
+    if (known && known === opts.resumeSessionId) args.push('--resume', known);
+    else if (known) args.push('--session-id', known);
     const child = spawn(CLAUDE_BIN, args, { cwd, shell: true });
     let out = '';
     let err = '';
@@ -550,19 +572,20 @@ function runJob(cwd, prompt, minutes, rulesFile = JOBS_RULES_FILE, resultDir = '
       if (stopped) { clearInterval(watch); log(`job stopping — ${stopped}`); killTree(child); }
     }, 60000);
     // If the kill never closes the pipes, free the slot anyway a minute later.
-    const backstop = setTimeout(() => settle(resolve, { timedOut: true, text: '', sessionId: null }), minutes * 60000 + 120000);
+    const backstop = setTimeout(() => settle(resolve, { timedOut: true, stopped: `past the ${minutes} min backstop`, text: '', sessionId: known }), minutes * 60000 + 120000);
     child.stdout.on('data', (c) => (out += c));
     child.stderr.on('data', (c) => (err += c));
     child.on('error', (e) => settle(reject, e));
     child.on('close', (code) => {
-      if (stopped) return settle(resolve, { timedOut: true, stopped, text: '', sessionId: null });
+      if (stopped) return settle(resolve, { timedOut: true, stopped, text: '', sessionId: known });
       if (code !== 0) return settle(reject, new Error(`claude exited ${code}: ${err.trim().slice(0, 500)}`));
       const trimmed = out.trim();
       try {
         const p = JSON.parse(trimmed);
-        settle(resolve, { timedOut: false, text: typeof p.result === 'string' ? p.result : trimmed, sessionId: typeof p.session_id === 'string' ? p.session_id : null });
+        const sessionId = typeof p.session_id === 'string' && UUID_RE.test(p.session_id) ? p.session_id : known;
+        settle(resolve, { timedOut: false, text: typeof p.result === 'string' ? p.result : trimmed, sessionId });
       } catch {
-        settle(resolve, { timedOut: false, text: trimmed, sessionId: null });
+        settle(resolve, { timedOut: false, text: trimmed, sessionId: known });
       }
     });
     const startedAt = Date.now();
@@ -626,7 +649,7 @@ function claimNonce(nonce) {
   fs.writeFileSync(path.join(NONCES_DIR, nonce), String(Date.now()), { flag: 'wx' });
 }
 
-// Returns { ok: true, body } (the prompt without its signature line) or { ok: false, why }.
+// Returns { ok: true, body, nonce } (body = the prompt without its signature line) or { ok: false, why }.
 function verifySignedPrompt(lane, prompt) {
   let pem;
   try {
@@ -638,12 +661,14 @@ function verifySignedPrompt(lane, prompt) {
   if (!v.ok) return v;
   const { body, nonce } = v;
   try {
-    claimNonce(nonce);
+    // Lowercase, like the continuation records keyed by it: two nonces that differ only in case are
+    // one nonce (and are one file on Windows anyway).
+    claimNonce(nonceKey(nonce));
   } catch (e) {
     if (e?.code === 'EEXIST') return { ok: false, why: `nonce ${nonce} already ran` };
     return { ok: false, why: `cannot record nonce (${e.message})` }; // fail closed: no replay record, no run
   }
-  return { ok: true, body };
+  return { ok: true, body, nonce };
 }
 
 // Fail a claimed row AND answer it. A bare 'failed' status never reaches the caller (the hub fires
@@ -680,19 +705,66 @@ async function addJobWorktree(repoDir, base, id) {
   // --no-track: the task branch must not take origin/<base> as its upstream, or a plain `git push`
   // there would fail (push.default=simple) or push the job's commits straight to the base branch.
   await git(repoDir, ['worktree', 'add', '--no-track', '-b', `task/${name}`, dir, `origin/${base}`]);
-  return dir;
+  return { dir, branch: `task/${name}` };
 }
 
 // After the run. Never --force: a worktree the job left with uncommitted changes is kept, so
-// unfinished work is never thrown away; git refuses and we only log it.
+// unfinished work is never thrown away; git refuses and we only log it. True iff it was removed.
 async function removeJobWorktree(repoDir, dir) {
   try {
     await git(repoDir, ['worktree', 'remove', dir]);
     log(`removed job worktree ${dir}`);
+    return true;
   } catch (e) {
     log(`kept job worktree ${dir} (${e.message})`);
+    return false;
   }
 }
+
+// The earlier job may still be in its own clean-up (its answer is posted before its worktree is
+// removed), in this poller or another, and the sweeper may be removing a long-parked worktree. Wait
+// up to 2 minutes for both to settle; after that live git decides (prepareWorktree).
+// Returns { rec: the freshest record, waited: true if it never settled }.
+async function settledRecord(of, rec, want) {
+  const until = Date.now() + 120000;
+  for (let cur = rec; ;) {
+    const busy = runningDirs.has(normPath(cur.worktree))
+      || cur.state === 'running' || cur.state === 'finishing'
+      || (sweepMarked(REPO_STATE_DIR, of) && cur.state !== 'expired' && cur.state !== 'kept');
+    if (!busy || Date.now() > until) return { rec: cur, waited: busy };
+    await new Promise((r) => setTimeout(r, 5000));
+    cur = readRecord(REPO_STATE_DIR, of, want) || cur;
+  }
+}
+
+// Removes worktrees parked longer than REPO_JOBS_PARK_DAYS (repo-jobs/continuation.mjs). At startup
+// and after every repo job; one sweep at a time in this process.
+let sweeping = false;
+async function sweepRepoJobs() {
+  if (sweeping) return;
+  sweeping = true;
+  try {
+    await sweepParked({
+      dir: REPO_STATE_DIR,
+      parkDays: REPO_JOBS_PARK_DAYS,
+      resolveRepo: (lane) => {
+        const conf = REPO_JOBS.get(String(lane).toLowerCase());
+        const repoDir = conf && resolveWorkspaceDir(conf.repo);
+        return repoDir ? { repo: conf.repo, repoDir } : null;
+      },
+      isRunning: (dir) => runningDirs.has(normPath(dir)),
+      removeWorktree: removeJobWorktree,
+      log,
+    });
+  } catch (e) {
+    log(`sweep of parked job worktrees failed (${e.message})`);
+  } finally {
+    sweeping = false;
+  }
+}
+
+const SESSION_RESUMED = 'resumed, this is the same conversation: continue from where you stopped, following the owner\'s answer';
+const SESSION_NEW = 'NEW, so you do not remember the earlier run: read the previous task\'s context in the prompt and this branch\'s commits';
 
 async function startJob(item, cwd) {
   const { id, workspace, prompt, permission_mode: permissionMode, conversation_id: conversationId, source } = item;
@@ -727,13 +799,35 @@ async function startJob(item, cwd) {
   }
   // A repo job must also carry its caller's signature (see verifySignedPrompt).
   let jobPrompt = prompt;
+  let nonce = null;
+  let of = null; // the earlier task this one continues (marker in the signed body), if any
+  let prev = null; // this machine's record of that earlier task, if it has one
   if (conf.repo) {
     const v = verifySignedPrompt(lane, prompt);
     if (!v.ok) {
       await failWithAnswer(item, `repo lane ${workspace}: ${v.why}`);
       return true;
     }
-    jobPrompt = v.body;
+    nonce = nonceKey(v.nonce); // records and markers use the lowercase key (parseContinue does too)
+    const cont = parseContinue(v.body);
+    jobPrompt = cont.body;
+    of = cont.of;
+    if (of) {
+      if (of === nonce) {
+        await failWithAnswer(item, `task ${nonce} names itself as the task it continues`);
+        return true;
+      }
+      // One continuation per task, record or not, on every poller, for ever (never pruned).
+      try {
+        claimContinuation(REPO_STATE_DIR, of, nonce);
+      } catch (e) {
+        await failWithAnswer(item, e?.code === 'EEXIST'
+          ? 'המשימה הקודמת כבר הומשכה. המשך מהמשימה האחרונה בשרשרת.'
+          : `cannot record the continuation of ${of} (${e.message})`);
+        return true;
+      }
+      prev = readRecord(REPO_STATE_DIR, of, { lane, repo: conf.repo, repoDir: cwd });
+    }
   }
   const jobName = `${new Date().toISOString().slice(0, 10)}-${String(id).slice(0, 8)}`;
   runningJobs.set(id, lane);
@@ -744,12 +838,80 @@ async function startJob(item, cwd) {
     let dir;
     let answerDir;
     let answered = false;
+    // A repo job's record (repo-jobs/continuation.mjs): written before Claude runs and again before
+    // the answer is posted, so the owner can never answer a task whose record does not exist yet.
+    let rec = null;
+    // Strict before Claude runs: a job whose record cannot be written fails (with an answer) rather
+    // than run unfindable. Later writes only log: the start record already holds the identity
+    // (worktree, branch, session), so a continuation still finds the run, after a short wait.
+    const save = (strict = false) => {
+      try {
+        writeRecord(REPO_STATE_DIR, rec);
+      } catch (e) {
+        if (strict) throw new Error(`cannot write the job record in ${REPO_STATE_DIR} (${e.message})`);
+        log(`job ${id}: could not write its record (${e.message})`);
+      }
+    };
+    const own = (fields) => {
+      rec = {
+        v: 1, lane, repo: conf.repo, base: conf.base, nonce, parent: of, root: prev?.root || of || nonce,
+        pid: process.pid, startedAt: new Date().toISOString(), state: 'running', resultStatus: null,
+        finishedAt: null, continuedBy: null, ...fields,
+      };
+      save(true);
+    };
+    // Where a repo job runs, and the bridge's note to Claude when it continues an earlier task.
+    // Returns { dir, note (null for a plain new task), resume (session id to resume, or null) }.
+    const setupRepoJob = async () => {
+      const freshTree = () => addJobWorktree(cwd, conf.base, id);
+      // A new worktree whose record cannot be written is removed again (never forced).
+      const ownFresh = async (t, fields) => {
+        try { own(fields); } catch (e) { await removeJobWorktree(cwd, t.dir); throw e; }
+      };
+      if (!prev) {
+        const t = await freshTree();
+        await ownFresh(t, { worktree: t.dir, branch: t.branch, sessionId: crypto.randomUUID() });
+        const note = of
+          ? `this continues task ${of}, but this machine has no record of that run. Worktree: ${t.dir} (NEW, from origin/${conf.base}). Branch: ${t.branch}.`
+          : null;
+        return { dir: t.dir, note, resume: null };
+      }
+      const settled = await settledRecord(of, prev, { lane, repo: conf.repo, repoDir: cwd });
+      const earlier = settled.rec;
+      try { writeRecord(REPO_STATE_DIR, { ...earlier, continuedBy: nonce }); } catch {}
+      // From here the earlier checkout is this job's: if anything below fails, it stays findable.
+      own({ worktree: earlier.worktree, branch: earlier.branch, sessionId: earlier.sessionId || crypto.randomUUID() });
+      const where = await prepareWorktree(cwd, earlier, freshTree);
+      if (where.how === 'fresh') await ownFresh(where, { ...rec, worktree: where.dir, branch: where.branch });
+      else { Object.assign(rec, { worktree: where.dir, branch: where.branch }); save(true); }
+      runningDirs.add(normPath(where.dir));
+      let synced = `new worktree from origin/${conf.base}`;
+      if (where.how !== 'fresh') {
+        const s = await syncWorktree(where.dir, conf.base);
+        synced = `fetched origin/${conf.base}, rebase onto it ${s.rebase}${s.why ? ` (${s.why})` : ''}`;
+      }
+      const how = {
+        same: 'the same worktree as before',
+        readded: 're-created at the same path from your branch',
+        fresh: `NEW, because ${where.why}; your earlier branch ${earlier.branch} is untouched`,
+      }[where.how];
+      const waited = settled.waited ? ` The earlier run's record still said '${earlier.state}' after 2 minutes.` : '';
+      log(`job ${id} continues ${of}: worktree ${where.how}${where.why ? ` (${where.why})` : ''}, ${synced}`);
+      return {
+        dir: where.dir,
+        note: `continuing task ${of}. Worktree: ${where.dir} (${how}). Branch: ${where.branch}. Git: ${synced}.${waited}`,
+        resume: earlier.sessionId,
+      };
+    };
+    let note = null;
+    let resume = null;
     try {
       try {
         if (conf.repo) {
           answerDir = path.join(REPO_RESULTS_DIR, jobName);
           fs.mkdirSync(answerDir, { recursive: true });
-          dir = await addJobWorktree(cwd, conf.base, id);
+          ({ dir, note, resume } = await setupRepoJob());
+          runningDirs.add(normPath(dir));
         } else {
           dir = path.join(cwd, jobName);
           fs.mkdirSync(dir, { recursive: true });
@@ -760,7 +922,24 @@ async function startJob(item, cwd) {
       }
       log(`job ${id} ws=${workspace} src=${source} [full, ${minutes} min] in ${dir} (${String(jobPrompt).slice(0, 50).replace(/\s+/g, ' ')}…)`);
       const rules = conf.repo ? REPO_RULES_FILE : rulesFor(workspace);
-      const { timedOut, stopped, text, sessionId } = await runJob(dir, jobPrompt, minutes, rules, conf.repo ? answerDir : '');
+      const withNote = (session) => (note ? `[Bridge: ${note} Session: ${session}.]\n\n${jobPrompt}` : jobPrompt);
+      let run;
+      if (!conf.repo) run = await runJob(dir, jobPrompt, minutes, rules, '');
+      else if (!resume) run = await runJob(dir, withNote(SESSION_NEW), minutes, rules, answerDir, { sessionId: rec.sessionId });
+      else {
+        try {
+          run = await runJob(dir, withNote(SESSION_RESUMED), minutes, rules, answerDir, { resumeSessionId: resume });
+        } catch (e) {
+          // Only a session that positively does not exist is retried: any other failure may come
+          // after tools already acted, and running the owner's instruction twice is worse.
+          if (!isNoSessionError(e)) throw e;
+          log(`job ${id}: session ${resume} cannot be resumed here (${e.message}), starting a new one`);
+          rec.sessionId = crypto.randomUUID();
+          save();
+          run = await runJob(dir, withNote(`${SESSION_NEW} (the earlier session could not be resumed on this machine)`), minutes, rules, answerDir, { sessionId: rec.sessionId });
+        }
+      }
+      const { timedOut, stopped, text, sessionId } = run;
       let response = text;
       if (timedOut) {
         // A run that was stopped may still have finished its work: the answer file is written the
@@ -779,11 +958,24 @@ async function startJob(item, cwd) {
           log(`job ${id}: stopped (${stopped}), posting ${partial.length} chars of ${JOB_RESULT_FILE}`);
         }
       }
+      if (rec) {
+        // Before the answer leaves: once the owner sees it, he can answer it at once.
+        if (sessionId) rec.sessionId = sessionId;
+        rec.resultStatus = answerStatus(response);
+        rec.finishedAt = new Date().toISOString();
+        rec.state = shouldPark(rec.resultStatus) ? 'parked' : 'finishing';
+        save();
+      }
       await postJobAnswer({ workspace, response, claude_session_id: sessionId, conversation_id: conversationId, outbox_id: id });
       answered = true;
       await hub('PATCH', { body: { id, status: 'sent' } });
       log(`job done ${id}`);
     } catch (e) {
+      if (rec?.state === 'running') {
+        // It failed before answering: keep the checkout for the owner's answer (parked).
+        Object.assign(rec, { resultStatus: 'failed', finishedAt: new Date().toISOString(), state: 'parked' });
+        save();
+      }
       // A repo job's caller waits on its callback: tell it (unless it already has its answer).
       if (conf.repo && !answered) await failWithAnswer(item, String(e.message).slice(0, 500));
       else {
@@ -791,8 +983,17 @@ async function startJob(item, cwd) {
         try { await hub('PATCH', { body: { id, status: 'failed', error: String(e.message).slice(0, 500) } }); } catch {}
       }
     } finally {
+      // A done job's worktree goes (never forced), unless a continuation already claimed this task,
+      // which then owns it. A parked one stays for the owner's answer (sweepRepoJobs ends that).
+      if (rec?.state === 'finishing' && dir) {
+        if (isContinued(REPO_STATE_DIR, nonce)) rec.state = 'parked';
+        else rec.state = (await removeJobWorktree(cwd, dir)) ? 'removed' : 'kept';
+        save();
+      }
       runningJobs.delete(id);
-      if (conf.repo && dir) await removeJobWorktree(cwd, dir);
+      if (dir) runningDirs.delete(normPath(dir));
+      if (rec?.worktree) runningDirs.delete(normPath(rec.worktree));
+      if (conf.repo) sweepRepoJobs();
       setTimeout(tick, 500); // a job that waited for the slot starts now
     }
   })();
@@ -1041,7 +1242,8 @@ function connectDoorbell() {
   });
 }
 
-log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · model=${CLAUDE_MODEL || '(CLI default)'} · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}] · jobs=[${[...JOBS_WORKSPACES].map(([w, m]) => `${w}:${m}m`).join(',')}]×${JOBS_PARALLEL} each from [${JOBS_SOURCES.join(',')}] · repo-jobs=[${[...REPO_JOBS].map(([w, c]) => `${w}→${c.repo}@${c.base}:${c.minutes}m from [${(REPO_JOB_SOURCES.get(w) || []).join('|')}]`).join(',')}] signed-full=[${[...SIGNED_FULL_SOURCES].map(([w, s]) => `${w}:${s.join('|')}`).join(',')}]`);
+log(`starting → doorbell=${WS_URL} · fallback=${FALLBACK_POLL_MS}ms · dirs=[${PROJECT_DIRS.join(', ')}] · model=${CLAUDE_MODEL || '(CLI default)'} · ws=[${WORKSPACE_ALLOWLIST.join(',') || 'any'}] · src=[${SOURCE_ALLOWLIST.join(',') || 'any'}] · jobs=[${[...JOBS_WORKSPACES].map(([w, m]) => `${w}:${m}m`).join(',')}]×${JOBS_PARALLEL} each from [${JOBS_SOURCES.join(',')}] · repo-jobs=[${[...REPO_JOBS].map(([w, c]) => `${w}→${c.repo}@${c.base}:${c.minutes}m from [${(REPO_JOB_SOURCES.get(w) || []).join('|')}]`).join(',')}] signed-full=[${[...SIGNED_FULL_SOURCES].map(([w, s]) => `${w}:${s.join('|')}`).join(',')}] continue=on park=${REPO_JOBS_PARK_DAYS}d state=${REPO_STATE_DIR}`);
+if (REPO_JOBS.size) sweepRepoJobs();  // worktrees parked past REPO_JOBS_PARK_DAYS
 maybeCatchup();                       // startup catchup (sets lastCatchupAt)
 setInterval(tick, FALLBACK_POLL_MS);  // safety net — Neon autosuspends between
 connectDoorbell();                    // primary push path
